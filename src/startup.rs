@@ -37,6 +37,30 @@ impl Drop for StartupLock {
     }
 }
 
+#[cfg(windows)]
+fn uninherit_launcher_stdio() -> io::Result<()> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> *mut c_void;
+        fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+    // CREATE_NO_WINDOW still inherits the launcher's original pipe handles.
+    // Keeping those handles in the daemon prevents callers from receiving EOF.
+    for kind in [-10i32, -11, -12] {
+        // SAFETY: these are the documented standard-handle selectors; invalid
+        // handles are excluded before calling SetHandleInformation.
+        let handle = unsafe { GetStdHandle(kind as u32) };
+        if !handle.is_null()
+            && handle as isize != -1
+            && unsafe { SetHandleInformation(handle, 1, 0) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Starts the shared service only when this profile has no running Core.
 pub async fn ensure(home: &Path) -> io::Result<()> {
     ipc::prepare_home(home)?;
@@ -93,6 +117,7 @@ pub async fn ensure(home: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        uninherit_launcher_stdio()?;
         command.creation_flags(0x08000000);
     }
     #[cfg(unix)]
