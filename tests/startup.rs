@@ -31,8 +31,11 @@ impl Drop for Profile {
 
 #[test]
 fn ensure_initializes_once_and_survives_the_launching_cli() {
-    let profile =
-        Profile(std::env::temp_dir().join(format!("ttjcore-startup-{}", uuid::Uuid::new_v4())));
+    #[cfg(unix)]
+    let temp_root = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let temp_root = std::env::temp_dir();
+    let profile = Profile(temp_root.join(format!("ttjcore-startup-{}", uuid::Uuid::new_v4())));
     std::thread::scope(|scope| {
         let first = scope.spawn(|| profile.command(&["ensure"]));
         let second = scope.spawn(|| profile.command(&["ensure"]));

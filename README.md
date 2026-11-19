@@ -68,7 +68,7 @@ Cargoが取得する直接依存は次のとおりです。推移依存のバー
 
 ## DBとプロファイル
 
-標準DBはCoreプロファイル内の`core.sqlite`です。プロファイルはWindowsでは`LOCALAPPDATA/.ttjcore`、Linux・macOSでは`$HOME/.ttjcore`です。`TTJCORE_HOME`、または各CLIコマンドの前の`--home <data-dir>`で変更できます。Unixでは他ユーザーが書き込めないディレクトリを使います。プロファイルには接続用トークンも保存されるため、Gitへ保存したり共有したりしないでください。
+標準DBはCoreプロファイル内の`core.sqlite`です。プロファイルはWindowsでは`LOCALAPPDATA/.ttjcore`、Linux・macOSでは`$HOME/.ttjcore`です。`TTJCORE_HOME`、または各CLIコマンドの前の`--home <data-dir>`で変更できます。Unixでは他ユーザーが書き込めない、ソケットのパス長制約に収まる短いディレクトリを使います。プロファイルには接続用トークンも保存されるため、Gitへ保存したり共有したりしないでください。
 
 ```sh
 ttjcore --home /path/to/profile ensure

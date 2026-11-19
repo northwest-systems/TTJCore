@@ -10,7 +10,12 @@ use ttjcore::{PROTOCOL, ipc, store::Store};
 
 #[tokio::test]
 async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
-    let home = std::env::temp_dir().join(format!("ttjcore-ipc-{}", uuid::Uuid::new_v4()));
+    // macOS temporary directories can exceed the Unix socket path limit.
+    #[cfg(unix)]
+    let temp_root = std::path::PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let temp_root = std::env::temp_dir();
+    let home = temp_root.join(format!("ttjcore-ipc-{}", uuid::Uuid::new_v4()));
     let store = Arc::new(Store::connect("sqlite::memory:", true).await.unwrap());
     let server = tokio::spawn(ipc::serve(Arc::clone(&store), home.clone()));
     for _ in 0..100 {
@@ -111,6 +116,6 @@ async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
     if let Some(store) = store {
         store.db.close().await.unwrap();
     }
-    assert_eq!(home.parent(), Some(std::env::temp_dir().as_path()));
+    assert_eq!(home.parent(), Some(temp_root.as_path()));
     std::fs::remove_dir_all(home).unwrap();
 }
