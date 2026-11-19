@@ -32,23 +32,42 @@ ttjcore call project.list
 
 ## フォルダ構造
 
+Linuxの`tree`形式で、配布対象のフォルダと末端ファイルを示します。`.git`とローカルの生成物は含みません。
+
 ```text
-assets/        共通アイコン（ライト・ダーク・黒・白の透過PNG）
-src/
-  main.rs       CLI
-  startup.rs    標準DBの準備と常駐Coreの起動
-  ipc.rs        IPCとstdio bridge
-  rpc.rs        JSON-RPCの検証
-  engine.rs     TTJの規則・CRUD・statusの変更
-  store.rs      ORM・transaction・変更通知
-  entity.rs     SeaORMのtable定義
-tests/          SQLite・PostgreSQL・IPCのテスト
-skills/ttjcore/
-  SKILL.md      LLM向け利用スキル
-  references/protocol.md CLI・JSON-RPC・eventの仕様
-.github/workflows/ OS別のビルド・テスト
-compose.postgres-test.yaml PostgreSQL互換性テスト用DB
-Cargo.toml / Cargo.lock   依存の宣言と固定
+TTJCore/                        # Rust製CLI・Core
+├── .github/                    # GitHubの設定
+│   └── workflows/              # GitHub Actions
+│       └── ci.yml              # ビルド・テストのCI
+├── assets/                     # 共通アイコン
+│   ├── app-icon-black.png      # 単色・黒の透過PNG
+│   ├── app-icon-light.png      # ライト用の透過PNG
+│   ├── app-icon-white.png      # 単色・白の透過PNG
+│   └── app-icon.png            # ダーク用の透過PNG
+├── skills/                     # LLM向け利用スキル
+│   └── ttjcore/                # Coreの利用スキル
+│       ├── references/         # 仕様の参照資料
+│       │   └── protocol.md     # CLI・JSON-RPC・eventの仕様
+│       └── SKILL.md            # LLM向けの操作手順
+├── src/                        # Rustソース
+│   ├── engine.rs               # TTJの規則・CRUD・status変更
+│   ├── entity.rs               # SeaORMのtable定義
+│   ├── ipc.rs                  # ローカルIPC・stdio bridge
+│   ├── lib.rs                  # Coreのmodule公開
+│   ├── main.rs                 # CLIの入口
+│   ├── rpc.rs                  # JSON-RPCの検証
+│   ├── startup.rs              # 標準DBの準備・常駐Coreの起動
+│   └── store.rs                # ORM・transaction・変更通知
+├── tests/                      # 自動テスト
+│   ├── contract.rs             # SQLite・PostgreSQLの動作契約
+│   ├── ipc.rs                  # IPC経由の呼び出し
+│   └── startup.rs              # Coreの自動起動・停止
+├── .gitignore                  # Gitの除外設定
+├── Cargo.lock                  # 依存crateのバージョン固定
+├── Cargo.toml                  # package情報・依存crate
+├── compose.postgres-test.yaml  # PostgreSQL互換性テスト用DB
+├── LICENSE                     # Apache-2.0ライセンス
+└── README.md                   # 概要・クイックスタート・フォルダ構造
 ```
 
 Cargoが取得する直接依存は次のとおりです。推移依存のバージョンはCargo.lockに固定しています。
