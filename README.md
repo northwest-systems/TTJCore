@@ -1,5 +1,10 @@
 # TTJCore
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/app-icon.png">
+  <img src="assets/app-icon-light.png" alt="TTJ" width="96" height="96">
+</picture>
+
 ## 概要
 
 [TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、Projectのknowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.0です。
@@ -28,6 +33,7 @@ ttjcore call project.list
 ## フォルダ構造
 
 ```text
+assets/        共通アイコン（ライト・ダーク・黒・白の透過PNG）
 src/
   main.rs       CLI
   startup.rs    標準DBの準備と常駐Coreの起動
