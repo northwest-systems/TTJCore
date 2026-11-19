@@ -365,26 +365,22 @@ fn read(
         return Ok(view(row));
     }
     if action == "list" {
+        let parent = p.get("parent").map(|_| text(p, "parent")).transpose()?;
+        let project = p.get("project").map(|_| text(p, "project")).transpose()?;
         let mut list = vec![];
         for row in engine
             .rows
             .values()
             .filter(|r| r.kind == kind && (include_deleted || !r.deleted))
         {
-            if let Some(parent) = p.get("parent") {
-                if parent.as_str().is_none() {
-                    return Err(invalid("parent must be an id"));
-                }
-                if row.parent.as_deref() != parent.as_str() {
-                    continue;
-                }
+            if parent
+                .as_ref()
+                .is_some_and(|parent| row.parent.as_ref() != Some(parent))
+            {
+                continue;
             }
-            if let Some(project) = p.get("project") {
-                if engine.project(row)?
-                    != project
-                        .as_str()
-                        .ok_or_else(|| invalid("project must be an id"))?
-                {
+            if let Some(project) = &project {
+                if engine.project(row)? != *project {
                     continue;
                 }
             }

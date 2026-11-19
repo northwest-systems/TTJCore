@@ -392,7 +392,7 @@ impl Engine {
                         || old.body["status"] != "active"
                     {
                         return Err(rule(
-                            "supersedes must reference active knowledge in the same Project",
+                            "supersedes must reference active Knowledge in the same Project",
                         ));
                     }
                     old.body["status"] = json!("supersed");
@@ -531,7 +531,7 @@ impl Engine {
             return Err(rule("Cancel or complete all affected work before deleting"));
         }
         if kind == "knowledge" && row.body["status"] == "active" {
-            return Err(rule("Supersede knowledge before deleting it"));
+            return Err(rule("Supersede Knowledge before deleting it"));
         }
         for mut target in targets {
             if target.deleted {
@@ -709,11 +709,16 @@ impl Engine {
                     .ok_or_else(|| invalid("run must be an id"))?,
             )?;
             if run.kind != "run"
+                || !run.active
                 || run.parent.as_deref() != Some(row.id.as_str())
                 || run.flags["revoked"] == true
                 || run.body["generation"] != row.flags["generation"]
             {
                 return Err(rule("Run authority has expired"));
+            }
+            let participants = strings(&run.body, "actor", true)?;
+            if self.actor.iter().any(|actor| !participants.contains(actor)) {
+                return Err(rule("Only Run participants may change Job status"));
             }
         }
         row.body["status"] = json!(target);

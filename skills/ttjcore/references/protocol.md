@@ -52,7 +52,7 @@ responseにはrequestと同じ`protocol`・`id`、および`result`または`err
 
 ## Recordとmethod
 
-Project → Task → Ticket → Jobの階層を持ち、RunはJobに属します。Ticketは1つのTaskに所属します。knowledgeはProjectに属します。
+Project → Task → Ticket → Jobの階層を持ち、RunはJobに属します。Ticketは1つのTaskに所属します。KnowledgeはProjectに属します。
 
 create入力のfieldは次のとおりです。`id`は共通のoptional fieldで、省略するとCoreがUUIDを発行します。削除済みを含む全recordと重複するIDは拒否します。
 
@@ -62,7 +62,7 @@ create入力のfieldは次のとおりです。`id`は共通のoptional fieldで
 | Task | project, objective, criteria | id, deadline |
 | Ticket | task, objective, jobs | id, assignee, depends, handoffs, resume, priority |
 | Job | objective, criteria | id, instructions, assignee |
-| knowledge | project, content, basis | id, supersedes |
+| Knowledge | project, content, basis | id, supersedes |
 
 Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成後のTicketでは`jobs`がID配列になります。Jobの追加・削除・並べ替え、Ticketのobjective、Jobのobjective・criteria・instructionsの変更は拒否します。
 
@@ -97,7 +97,7 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成�
 
 record wrapperには`record, revision, deleted, started, active, constraints, display`が入ります。`record`がTTJの内容です。変更responseの`result.operation`がoperation ID、`result.value`が変更結果です。`run.start`のvalueは`run`・`job`のwrapperを含みます。
 
-`project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotのknowledgeはactiveなrecordを返します。
+`project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotの`knowledge`はactiveなKnowledgeを返します。
 
 ## CRUDと再送
 
@@ -125,13 +125,13 @@ update・delete・status.set・Runの操作は直前のgetまたはsnapshotか�
 | Task | objective, criteria, deadline |
 | Ticket | assignee, depends, handoffs, resume, priority |
 | Job | assignee, resume |
-| knowledge | status |
+| Knowledge | status |
 
 completed・canceledのrecordは変更できません。Ticketのdependsは実行開始後に変更できません。patchの未指定fieldは維持します。deadline・resume・assigneeをnullにするとfieldを除去し、空の配列は`[]`で指定します。
 
-削除は論理削除です。配下のTask・Ticket・Jobがすべてcompletedまたはcanceledである必要があり、履歴・ID・dependsの参照は残します。Jobは所属Ticketと一緒に削除し、Runの個別削除はできません。Task・Ticketを削除してもProjectのknowledgeは残ります。
+削除は論理削除です。配下のTask・Ticket・Jobがすべてcompletedまたはcanceledである必要があり、履歴・ID・dependsの参照は残します。Jobは所属Ticketと一緒に削除し、Runの個別削除はできません。Task・Ticketを削除してもProjectのKnowledgeは残ります。
 
-knowledgeのcontent・basisを訂正する場合は、新しいknowledge.createのsupersedesに旧IDを指定します。同じProjectのactiveなknowledgeが対象です。旧recordはsupersedとなり、content・basisを保持します。activeなknowledgeは削除できません。
+Knowledgeの`content`・`basis`を訂正する場合は、新しい`knowledge.create`の`supersedes`に旧IDを指定します。同じProjectのactiveなKnowledgeが対象です。旧recordはsupersedとなり、content・basisを保持します。activeなKnowledgeは削除できません。
 
 ## Runとstatus
 
@@ -146,7 +146,7 @@ Job・Taskをcompletedにするには、status.setに`criteria_met:true`と確�
 | release:true | pausedを解除する際に指定 |
 | resolved:true | waiting・blockedの原因を解消したことを確認して指定 |
 | criteria_met:true, result | Job・Taskをcompletedにする際に指定 |
-| run | Jobの変更時にRunの権限・generationも検証する場合に指定 |
+| run | Jobの変更時にRunを指定。有効なRun・参加actor・generationを検証。終了・失効したRunは使用不可 |
 | retry_of, safety | run.startで再試行する場合の元Runと確認内容。停止未確認のRunがある場合はsafetyが必要 |
 
 同じTicketの別Jobの同時実行、未完了のdependsを飛ばす開始、completed・canceledからの復帰を拒否します。同一Jobにはassigneeごとの共同作業のRunを作成できます。

@@ -7,7 +7,7 @@
 
 ## 概要
 
-[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、Projectのknowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.0です。
+[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、ProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.0です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 

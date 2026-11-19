@@ -149,6 +149,13 @@ async fn run_results_and_completion_aggregation() {
     start(&db, "a1", "r").await.unwrap();
     assert_eq!(get(&db, "task", "t").await["record"]["status"], "doing");
     finish(&db, "r").await.unwrap();
+    assert_eq!(
+        state(&db, "a1", "job", "waiting", json!({"run":"r"}))
+            .await
+            .unwrap_err()
+            .code,
+        -32010
+    );
     assert_eq!(get(&db, "job", "a1").await["record"]["status"], "doing");
     complete(&db, "a1").await;
     state(&db, "a2", "job", "canceled", json!({}))
@@ -350,6 +357,12 @@ async fn knowledge_replacement_preserves_old_content() {
 #[tokio::test]
 async fn rpc_protocol_errors_batches_and_notifications() {
     let db = db().await;
+    for params in [json!({"parent":false}), json!({"project":1})] {
+        assert_eq!(
+            db.call("project.list", params).await.unwrap_err().code,
+            -32602
+        );
+    }
     assert_eq!(
         rpc::dispatch(&db, "{").await.unwrap()["error"]["code"],
         -32700
@@ -524,6 +537,18 @@ async fn joint_work_in_one_job_keeps_independent_run_authorities() {
     db.call("run.start",json!({"id":"ra","job":"a1","revision":job["revision"],"actor":["reviewer-a"],"reason":"First review"})).await.unwrap();
     let job = get(&db, "job", "a1").await;
     db.call("run.start",json!({"id":"rb","job":"a1","revision":job["revision"],"actor":["reviewer-b"],"reason":"Joint review"})).await.unwrap();
+    let job = get(&db, "job", "a1").await;
+    assert_eq!(
+        db.call(
+            "status.set",
+            json!({"id":"a1","revision":job["revision"],
+            "status":"waiting","run":"ra","actor":["reviewer-b"],"reason":"Wrong Run"})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        -32010
+    );
     for (id, actor) in [("ra", "reviewer-a"), ("rb", "reviewer-b")] {
         let run = get(&db, "run", id).await;
         db.call("run.finish",json!({"id":id,"revision":run["revision"],"actor":[actor],"reason":"Review finished","result":"Checked"})).await.unwrap();
