@@ -8,13 +8,16 @@ use std::{
 struct Profile(PathBuf);
 impl Profile {
     fn command(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ttjcore"))
+        eprintln!("Starting CLI {}", args[0]);
+        let output = Command::new(env!("CARGO_BIN_EXE_ttjcore"))
             .arg("--home")
             .arg(&self.0)
             .args(args)
             .env_remove("TTJCORE_DATABASE_URL")
             .output()
-            .unwrap()
+            .unwrap();
+        eprintln!("CLI {} exited", args[0]);
+        output
     }
 }
 impl Drop for Profile {

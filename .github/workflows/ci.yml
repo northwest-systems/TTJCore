@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup update stable --no-self-update
-      - run: cargo test --locked
+      - run: cargo test --locked --no-run
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ttjcore-${{ runner.os }}-${{ runner.arch }}
@@ -29,3 +29,5 @@ jobs:
             target/debug/ttjcore.exe
           if-no-files-found: error
           retention-days: 7
+      - run: cargo test --locked -- --nocapture
+        timeout-minutes: 2
