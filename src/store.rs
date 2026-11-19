@@ -427,23 +427,24 @@ pub fn discover() -> Value {
         }
     }
     methods.extend([
+        json!({"name":"core.stop","mutates":false,"required":[],"transport":"IPC service control"}),
         json!({"name":"events.list","mutates":false,"required":[]}),
         json!({"name":"events.wait","mutates":false,"required":[]}),
         json!({"name":"events.subscribe","mutates":false,"required":[],"transport":"persistent IPC or rpc stdio bridge"}),
         json!({"name":"project.snapshot","mutates":false,"required":["id"]}),
         json!({"name":"timeline.list","mutates":false,"required":["project"]}),
         json!({"name":"status.set","mutates":true,"required":["actor","reason","id","revision","status"]}),
-        json!({"name":"run.start","mutates":true,"required":["actor","reason","id","job","revision"]}),
+        json!({"name":"run.start","mutates":true,"required":["actor","reason","job","revision"]}),
         json!({"name":"run.finish","mutates":true,"required":["actor","reason","id","revision","result"]}),
     ]);
     json!({"methods":methods,
         "record_fields":{
-            "project":{"required":["id","name"]},
-            "task":{"required":["id","project","objective","criteria"],"optional":["deadline"]},
-            "ticket":{"required":["id","task","objective","jobs"],"optional":["assignee","depends","handoffs","resume","priority"],
+            "project":{"required":["name"]},
+            "task":{"required":["project","objective","criteria"],"optional":["deadline"]},
+            "ticket":{"required":["task","objective","jobs"],"optional":["assignee","depends","handoffs","resume","priority"],
                 "jobs":"Non-empty array of complete Job objects; IDs and order are fixed atomically"},
-            "job":{"required":["id","objective","criteria"],"optional":["instructions","assignee"]},
-            "knowledge":{"required":["id","project","content","basis"],"optional":["supersedes"]}
+            "job":{"required":["objective","criteria"],"optional":["instructions","assignee"]},
+            "knowledge":{"required":["project","content","basis"],"optional":["supersedes"]}
         },
         "field_types":{
             "criteria":"Non-empty array of non-empty strings",
@@ -452,7 +453,7 @@ pub fn discover() -> Value {
             "depends":"Array of Ticket IDs",
             "handoffs":"Array of short strings",
             "deadline":"Timezone-qualified RFC 3339 datetime",
-            "id":"Globally unique non-empty string",
+            "id":"Globally unique non-empty string; UUID generated on create/run.start when omitted",
             "revision":"Integer returned by the latest read"
         },
         "editable_fields":{
@@ -460,6 +461,9 @@ pub fn discover() -> Value {
             "ticket":["assignee","depends","handoffs","resume","priority"],
             "job":["assignee","resume"],"knowledge":["status"]
         },
+        "display_metadata":{"storage":"Outside TTJ record; returned as wrapper.display",
+            "fields":{"summary":"Short string for cards","icon":"User-defined icon key"},
+            "write":"Optional display object on create/update; inline Job definitions may include display"},
         "mutation_options":{
         "operation":"Caller-generated unique id for safe retries; generated when omitted",
         "revision":"Revision returned by the latest read; required for updates/deletes",

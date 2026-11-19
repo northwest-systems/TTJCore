@@ -42,7 +42,8 @@ pub fn terminal(body: &Value) -> bool {
 }
 pub fn view(row: &record::Model) -> Value {
     json!({"record":row.body,"revision":row.revision,"deleted":row.deleted,
-        "started":row.started,"active":row.active,"constraints":row.flags})
+        "started":row.started,"active":row.active,"constraints":row.flags,
+        "display":row.flags.get("display").cloned().unwrap_or(json!({}))})
 }
 pub struct Change {
     pub row: record::Model,
@@ -129,7 +130,13 @@ impl Engine {
         });
         Ok(())
     }
-    fn insert(&mut self, kind: &str, parent: Option<String>, body: Value) -> Result<String> {
+    fn insert(
+        &mut self,
+        kind: &str,
+        parent: Option<String>,
+        body: Value,
+        display: Value,
+    ) -> Result<String> {
         let id = text(&body, "id")?;
         if self.rows.contains_key(&id) {
             return Err(conflict());
@@ -144,7 +151,7 @@ impl Engine {
                 started: false,
                 deleted: false,
                 active: false,
-                flags: json!({}),
+                flags: json!({"display":display}),
             },
             "record.created",
         )?;
@@ -272,12 +279,37 @@ impl Engine {
         }
         Ok(())
     }
+    fn assign_id(body: &mut Value) -> Result<()> {
+        if !body.is_object() {
+            return Err(invalid("record must be an object"));
+        }
+        if body.get("id").is_none() {
+            body["id"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+        text(body, "id")?;
+        Ok(())
+    }
+    fn display(value: Option<&Value>) -> Result<Value> {
+        let value = value.cloned().unwrap_or(json!({}));
+        Self::allowed(&value, &["summary", "icon"])?;
+        for (key, value) in value.as_object().unwrap() {
+            if !value.is_string() || (key == "icon" && value.as_str().unwrap().trim().is_empty()) {
+                return Err(invalid(
+                    "display values must be strings; icon must be non-empty",
+                ));
+            }
+        }
+        Ok(value)
+    }
     pub fn create(&mut self, kind: &str, p: &Value) -> Result<Value> {
         let mut body = p
             .get("record")
             .cloned()
             .ok_or_else(|| invalid("record is required"))?;
+        Self::assign_id(&mut body)?;
+        let display = Self::display(p.get("display"))?;
         let mut jobs = vec![];
+        let mut job_displays = vec![];
         let parent = match kind {
             "project" => {
                 Self::allowed(&body, &["id", "name"])?;
@@ -321,7 +353,10 @@ impl Engine {
                         invalid("jobs must contain one or more complete Job definitions")
                     })?;
                 let mut ids = vec![];
-                for job in &jobs {
+                for job in &mut jobs {
+                    Self::assign_id(job)?;
+                    let display = job.as_object_mut().unwrap().remove("display");
+                    job_displays.push(Self::display(display.as_ref())?);
                     Self::allowed(
                         job,
                         &["id", "objective", "criteria", "instructions", "assignee"],
@@ -377,10 +412,10 @@ impl Engine {
             body["status"] = json!("todo");
         }
         Self::validate(kind, &body)?;
-        let id = self.insert(kind, parent, body)?;
-        for mut job in jobs {
+        let id = self.insert(kind, parent, body, display)?;
+        for (mut job, display) in jobs.into_iter().zip(job_displays) {
             job["status"] = json!("todo");
-            self.insert("job", Some(id.clone()), job)?;
+            self.insert("job", Some(id.clone()), job, display)?;
         }
         self.check_cycles()?;
         self.reconcile()?;
@@ -412,6 +447,15 @@ impl Engine {
             && !matches!(patch["status"].as_str(), Some("active" | "supersed"))
         {
             return Err(invalid("Knowledge status must be active or supersed"));
+        }
+        if p.get("display").is_some() {
+            let display = Self::display(p.get("display"))?;
+            if !row.flags["display"].is_object() {
+                row.flags["display"] = json!({});
+            }
+            for (key, value) in display.as_object().unwrap() {
+                row.flags["display"][key] = value.clone();
+            }
         }
         let previous_assignee = row.body.get("assignee").cloned();
         for (key, value) in patch.as_object().unwrap() {
@@ -798,8 +842,13 @@ impl Engine {
             }
             self.save(task, "status.changed")?;
         }
-        let body = json!({"id":text(p,"id")?,"job":job.id,"actor":self.actor,"started":self.now,"generation":generation});
-        let id = self.insert("run", Some(job.id.clone()), body)?;
+        let mut run_id = json!({});
+        if let Some(id) = p.get("id") {
+            run_id["id"] = id.clone();
+        }
+        Self::assign_id(&mut run_id)?;
+        let body = json!({"id":run_id["id"],"job":job.id,"actor":self.actor,"started":self.now,"generation":generation});
+        let id = self.insert("run", Some(job.id.clone()), body, json!({}))?;
         let mut run = self.get(&id)?;
         run.active = true;
         self.save(run, "run.started")?;

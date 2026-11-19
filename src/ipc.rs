@@ -32,9 +32,11 @@ pub fn home() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TTJCORE_HOME") {
         return Ok(path.into());
     }
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("HOME"))
-        .ok_or_else(|| io::Error::other("Set TTJCORE_HOME"))?;
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA");
+    #[cfg(not(windows))]
+    let base = std::env::var_os("HOME");
+    let base = base.ok_or_else(|| io::Error::other("Set TTJCORE_HOME"))?;
     Ok(PathBuf::from(base).join(".ttjcore"))
 }
 fn address(endpoint: &str) -> io::Result<Name<'_>> {
@@ -59,7 +61,7 @@ fn endpoint(home: &Path) -> String {
         home.join("core.sock").to_string_lossy().into_owned()
     }
 }
-fn prepare_home(home: &Path) -> io::Result<()> {
+pub fn prepare_home(home: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -133,6 +135,15 @@ pub async fn serve(store: Arc<Store>, home: PathBuf) -> io::Result<()> {
         endpoint: endpoint(&home),
         token: uuid::Uuid::new_v4().to_string(),
     };
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::symlink_metadata(&info.endpoint) {
+        use std::os::unix::fs::FileTypeExt;
+        if metadata.file_type().is_socket()
+            && Stream::connect(address(&info.endpoint)?).await.is_err()
+        {
+            std::fs::remove_file(&info.endpoint)?;
+        }
+    }
     let listener = ListenerOptions::new()
         .name(address(&info.endpoint)?)
         .create_tokio()?;
@@ -143,14 +154,16 @@ pub async fn serve(store: Arc<Store>, home: PathBuf) -> io::Result<()> {
     }
     publish(&home, &info)?;
     eprintln!("TTJCore local IPC is ready");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>return Ok(()),
+            _=shutdown.notified()=>return Ok(()),
             accepted=listener.accept()=>{
                 let stream=accepted?;
-                let store=Arc::clone(&store);let token=info.token.clone();
+                let store=Arc::clone(&store);let token=info.token.clone();let shutdown=Arc::clone(&shutdown);
                 tokio::spawn(async move {
-                    if handle(stream,store,&token).await.is_err() {
+                    if handle(stream,store,&token,shutdown).await.is_err() {
                         // A disconnected client must not terminate the shared Core.
                     }
                 });
@@ -158,7 +171,12 @@ pub async fn serve(store: Arc<Store>, home: PathBuf) -> io::Result<()> {
         }
     }
 }
-async fn handle(stream: Stream, store: Arc<Store>, token: &str) -> io::Result<()> {
+async fn handle(
+    stream: Stream,
+    store: Arc<Store>,
+    token: &str,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> io::Result<()> {
     let mut reader = BufReader::new(&stream).lines();
     let mut writer = &stream;
     let mut receiver = store.subscribe();
@@ -173,13 +191,17 @@ async fn handle(stream: Stream, store: Arc<Store>, token: &str) -> io::Result<()
                         send(&mut writer,&failure(request["id"].clone(),"Local Core authentication failed")).await?;
                         continue;
                     }
-                    if request["method"]=="events.subscribe" {
+                    if request["method"]=="events.subscribe" || request["method"]=="core.stop" {
                         if request["jsonrpc"]!="2.0" || request["protocol"]!=PROTOCOL
                             || request.get("id").is_none()
                             || !request["id"].is_string() && !request["id"].is_number() && !request["id"].is_null() {
                             send(&mut writer,&json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":null,
-                                "error":{"code":-32600,"message":"Subscribe requires a valid request id and protocol"}})).await?;
+                                "error":{"code":-32600,"message":"A valid request id and protocol are required"}})).await?;
                             continue;
+                        }
+                        if request["method"]=="core.stop" {
+                            send(&mut writer,&json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":request["id"],"result":{"stopping":true}})).await?;
+                            shutdown.notify_one();return Ok(());
                         }
                         let mut params=request.get("params").cloned().unwrap_or(json!({}));
                         match store.call("events.list",params.clone()).await {

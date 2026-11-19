@@ -1,70 +1,100 @@
 # TTJCore
 
-[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)のProject・Task・Ticket・Job・Run・長期知識を管理するRust製CLIです。GUIは[herdr Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。
+## 概要
 
-基本のDBはSQLiteです。接続URLを変更すると任意のPostgreSQLへ接続できます。保存にはSeaORMを使い、作業データ・変更履歴・再送防止の結果を同一トランザクションで確定します。TTJCore自身はTCPポートを開きません。
+[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Jobと実行履歴Run、Projectのknowledgeを管理するRust製CLIです。画面は[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.0です。
 
-## ビルド
+SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じトランザクションで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketで接続を共有します。
 
-Rustのstableツールチェーンと、そのOSでRustをリンクできる開発ツールが必要です。SQLiteドライバーのビルドにはCコンパイラーも使用します。
+Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。削除は履歴・依存参照を残す論理削除です。
 
-~~~sh
-cargo build --locked --release
-~~~
+## クイックスタート
 
-実行ファイルはtarget/release/ttjcore（Windowsではttjcore.exe）です。PATHへインストールする場合:
+ビルド環境にはRust stableのCargoとOSのCコンパイラー・リンカーが必要です。CargoはCoreと依存クレートをビルドし、次のコマンドで実行ファイルをCargoのbinディレクトリへインストールします。SQLiteドライバーのビルドにもCコンパイラーを使います。
 
-~~~sh
+```sh
+git clone https://github.com/northwest-systems/TTJCore.git
+cd TTJCore
+git checkout v0.1.0
 cargo install --path . --locked
-~~~
+ttjcore ensure
+ttjcore call project.list
+```
 
-Cargoが取得する直接依存は次のとおりです。固定した推移依存はCargo.lockに記録しています。
+`ttjcore`をPATHから実行できる状態にしてください。`ensure`は標準DBを初期化し、GUIなしでCoreを常駐起動します。すでに起動中なら同じCoreに接続します。Herdr Modの標準接続はこの処理を自動で行うため、日常操作でinit・serveを実行する必要はありません。
+
+CLIからProjectを作成する例です。次の内容を`project.json`に保存して実行します。
+
+```json
+{"actor":["operator"],"reason":"作業領域を作る","operation":"create-example-project","record":{"name":"開発プロジェクト"}}
+```
+
+```sh
+ttjcore call project.create --file project.json
+```
+
+作成されたIDは`result.value.record.id`に返ります。Project・Task・Ticket・Job・knowledgeの作成、run.startでは、IDを省略するとCoreがUUIDを発行します。明示IDも使用できますが、削除済みを含む全レコードと重複するIDは拒否します。同じoperationと要求を再送すると、生成済みIDを含む同じ結果を返します。
+
+停止は`ttjcore stop`です。Herdrを閉じても、LLMなどが共有するCoreは停止しません。
+
+## フォルダ構造
+
+```text
+src/
+  main.rs       CLI
+  startup.rs    標準DBの準備と常駐Coreの起動
+  ipc.rs        ローカルIPCと標準入出力ブリッジ
+  rpc.rs        JSON-RPCの検証
+  engine.rs     TTJの規則・CRUD・状態遷移
+  store.rs      ORM・トランザクション・変更通知
+  entity.rs     SeaORMのテーブル定義
+tests/          SQLite・PostgreSQL・IPCのテスト
+skills/ttjcore/ LLM向け利用スキル
+.github/workflows/ OS別のビルド・テスト
+compose.postgres-test.yaml PostgreSQL互換性テスト用DB
+Cargo.toml / Cargo.lock   依存の宣言と固定
+```
+
+Cargoが取得する直接依存は次のとおりです。推移依存のバージョンはCargo.lockに固定しています。
 
 | クレート | 用途 |
 |---|---|
-| sea-orm | SQLite・PostgreSQL共通のDB操作とトランザクション |
-| tokio | ORM・IPC・変更通知を動かす非同期実行基盤 |
-| interprocess | Windows named pipe・Unix domain socketの共通API |
-| serde・serde_json | JSONの入出力 |
+| sea-orm | SQLite・PostgreSQL共通のDB操作 |
+| tokio | DB・IPC・変更通知の非同期実行 |
+| interprocess | named pipe・Unix domain socket |
+| serde・serde_json | JSON入出力 |
 | time | タイムゾーン付き日時の検証・生成 |
-| uuid | 省略された操作IDの生成 |
+| uuid | レコードID・操作ID・接続用トークンの生成 |
 
-## DBを初期化する
+## DBとプロファイル
 
-既定の接続先は、起動ディレクトリに作るsqlite://ttjcore.sqlite?mode=rwcです。
+標準DBはCoreプロファイル内の`core.sqlite`です。プロファイルはWindowsでは`LOCALAPPDATA/.ttjcore`、Linux・macOSでは`$HOME/.ttjcore`です。`TTJCORE_HOME`、または各CLIコマンドの前の`--home <data-dir>`で変更できます。Unixでは他ユーザーが書き込めないディレクトリを使います。プロファイルには接続用トークンも保存されるため、Gitへ保存したり共有したりしないでください。
 
-~~~sh
-ttjcore init
-ttjcore serve
-~~~
+```sh
+ttjcore --home /path/to/profile ensure
+ttjcore --home /path/to/profile call project.list
+ttjcore --home /path/to/profile stop
+```
 
-別のSQLiteファイルやPostgreSQLを使う場合はTTJCORE_DATABASE_URLを設定してからinitを実行します。SQLiteファイルの親ディレクトリ、PostgreSQLのDB・接続ユーザーは事前に用意してください。
+任意のSQLite・PostgreSQLを使う場合は、Coreを起動する環境で`TTJCORE_DATABASE_URL`を設定します。SQLiteファイルの親ディレクトリ、PostgreSQLのDB・接続ユーザーは事前に用意してください。
 
 PowerShell 7:
 
-~~~powershell
-$env:TTJCORE_DATABASE_URL = 'sqlite://ttjcore.sqlite?mode=rwc'
-ttjcore init
-~~~
+```powershell
+$env:TTJCORE_DATABASE_URL = 'postgresql://<role>:<password>@<host>:<port>/<database>'
+ttjcore ensure
+```
 
 Bash:
 
-~~~sh
-export TTJCORE_DATABASE_URL='sqlite://ttjcore.sqlite?mode=rwc'
-ttjcore init
-~~~
+```sh
+export TTJCORE_DATABASE_URL='postgresql://<role>:<password>@<host>:<port>/<database>'
+ttjcore ensure
+```
 
-PostgreSQLの接続URLはpostgresql://<role>:<password>@<host>:<port>/<database>の形式です。パスワードはURLエンコードしてください。接続先の認証・TLS設定に応じて接続オプションを指定できます。接続情報をGitへ保存しないでください。
+パスワードはURLエンコードし、認証・TLS設定に応じた接続オプションを指定します。接続情報をGitへ保存しないでください。すでに起動中のCoreは設定変更で切り替わりません。同じプロファイルのCoreをstopしてからensureしてください。initはスキーマ作成、serveはフォアグラウンド起動として引き続き使用でき、serveはCtrl+Cでも停止できます。
 
-initは初期スキーマを作成します。異なるprotocolのDBは拒否します。初期化後、同じDB設定でttjcore serveを起動しておき、別の端末からcallまたはrpcで接続します。停止はserveを起動した端末でCtrl+Cです。
-
-## 常駐Coreへの接続
-
-serveがDBへの接続を所有します。callとrpcはWindowsではnamed pipe、Linux・macOSではUnix domain socketを通じて同じCoreへ接続します。TTJCORE_DATABASE_URLを使うのはinitとserveだけです。
-
-TTJCORE_HOMEは接続先のプロファイルです。省略するとWindowsではLOCALAPPDATA/.ttjcore、Unixでは$HOME/.ttjcoreを使います。別のプロファイルを使う場合は、serve・クライアント・Herdrに同じ値を設定してください。Unixでは他ユーザーが書き込めないディレクトリを使います。
-
-プロファイルにはローカル接続情報と接続用トークンが保存されます。Gitへ保存せず、共有しないでください。同一プロファイルで起動できるCoreは1つです。DB接続エラーはserveの起動時、Core未起動・プロファイルの不一致はクライアント接続時に確認します。
+DB設定はensure・init・serveが使います。call・rpc・Herdrは同じプロファイルのCoreに接続し、DBへ直接接続しません。異なるTTJ protocolのDBは拒否します。
 
 ## CLIで作成する
 
@@ -77,7 +107,7 @@ ttjcore call ticket.create --params '{"actor":["operator"],"reason":"固定し�
 ttjcore call project.snapshot --params '{"id":"demo"}'
 ~~~
 
-Ticketと全Jobは一括作成します。JobのID列はサーバーが生成し、作成後の追加・削除・並べ替えや目標・条件・手順の変更を拒否します。
+Ticketと全Jobは一括作成します。JobのIDを省略するとUUIDを発行し、ID列はサーバーが生成します。作成後の追加・削除・並べ替えや目標・条件・手順の変更を拒否します。
 
 ## 参照・更新・削除
 
@@ -109,7 +139,7 @@ ttjcore call ticket.update --params '{"actor":["operator"],"reason":"担当を�
 
 ## 実行と状態変更
 
-run.startにJobのrevision、Runのid、実参加者のactorを渡します。run.finishにはRun自身のrevisionと結果を渡します。
+run.startにJobのrevisionと実参加者のactorを渡します。Runのidは省略すると自動発行します。run.finishにはRun自身のrevisionと結果を渡します。
 
 ~~~sh
 ttjcore call run.start --params '{"actor":["operator"],"reason":"開始条件を確認した","operation":"start-draft","id":"draft-run","job":"draft","revision":1}'
@@ -194,6 +224,16 @@ ttjcore methods、またはrpc.discoverでメソッドと必要項目を確認�
 | -32001 | ローカルCoreへの認証失敗 |
 
 CLIのcallはRPCエラー時に終了コード2、起動・接続等の失敗時に1を返します。
+
+### 表示情報
+
+作成・更新要求のトップレベルにdisplayを指定できます。summaryはカードの短い概要、iconは任意のアイコンキーです。ticket.createの各Job定義にもdisplay.iconを指定でき、TTJのJob本体から分離して保存します。参照時はラッパーのdisplayに返し、変更履歴にも残ります。
+
+```json
+{"actor":["operator"],"reason":"概要を付ける","id":"invitation","revision":1,"patch":{},"display":{"summary":"案内文を確認する"}}
+```
+
+利用スキルは[skills/ttjcore/SKILL.md](skills/ttjcore/SKILL.md)です。
 
 ## テスト
 

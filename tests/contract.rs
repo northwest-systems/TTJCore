@@ -558,3 +558,62 @@ async fn concurrent_changes_with_the_same_revision_commit_only_once() {
     second.db.close().await.unwrap();
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
+    async fn auto(db: &Store, method: &str, p: Value) -> ttjcore::Result<Value> {
+        change(db, method, p)
+            .await
+            .map(|value| value["value"].clone())
+    }
+
+    let db = db().await;
+    let request = json!({"operation":"auto-project","record":{"name":"Automatic IDs"}});
+    let project = auto(&db, "project.create", request.clone()).await.unwrap();
+    assert_eq!(project, auto(&db, "project.create", request).await.unwrap());
+    uuid::Uuid::parse_str(project["record"]["id"].as_str().unwrap()).unwrap();
+    let task = auto(
+        &db,
+        "task.create",
+        json!({"record":{"project":project["record"]["id"],
+        "objective":"Deliver","criteria":["Verified"]}}),
+    )
+    .await
+    .unwrap();
+    let request = json!({"operation":"auto-ticket","display":{"summary":"Compact card"},
+        "record":{"task":task["record"]["id"],"objective":"Review","jobs":[
+        {"objective":"Prepare","criteria":["Ready"],"display":{"icon":"job"}},
+        {"objective":"GitHub review","criteria":["Approved"],"display":{"icon":"github"}}]}});
+    let ticket = auto(&db, "ticket.create", request.clone()).await.unwrap();
+    assert_eq!(ticket, auto(&db, "ticket.create", request).await.unwrap());
+    assert_eq!(ticket["display"]["summary"], "Compact card");
+    assert!(ticket["record"].get("summary").is_none());
+    let ids = ticket["record"]["jobs"].as_array().unwrap();
+    assert_ne!(ids[0], ids[1]);
+    let job = get(&db, "job", ids[1].as_str().unwrap()).await;
+    assert_eq!(job["display"]["icon"], "github");
+    assert!(job["record"].get("display").is_none());
+    let updated = auto(
+        &db,
+        "job.update",
+        json!({"id":job["record"]["id"],"revision":job["revision"],
+        "patch":{},"display":{"icon":"custom.star"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated["display"]["icon"], "custom.star");
+    let first = get(&db, "job", ids[0].as_str().unwrap()).await;
+    let start = json!({"operation":"auto-run","job":ids[0],"revision":first["revision"]});
+    let run = auto(&db, "run.start", start.clone()).await.unwrap();
+    uuid::Uuid::parse_str(run["run"]["record"]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(run, auto(&db, "run.start", start).await.unwrap());
+    assert!(
+        auto(
+            &db,
+            "project.create",
+            json!({"record":{"id":project["record"]["id"],"name":"Duplicate"}})
+        )
+        .await
+        .is_err()
+    );
+}

@@ -95,8 +95,18 @@ async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
     assert!(unchanged["result"]["events"].as_array().unwrap().is_empty());
     drop(reader);
     drop(stream);
-    server.abort();
-    let _ = server.await;
+    let stopped = ipc::call(
+        &home,
+        json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":4,"method":"core.stop","params":{}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped["result"]["stopping"], true);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let store = Arc::try_unwrap(store).ok();
     if let Some(store) = store {
         store.db.close().await.unwrap();
