@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ttjcore_test
+      POSTGRES_USER: ttjcore_test
+      POSTGRES_PASSWORD: ${TTJCORE_POSTGRES_PASSWORD:?Set TTJCORE_POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:${TTJCORE_POSTGRES_PORT:-15432}:5432"
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ttjcore_test -d ttjcore_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
