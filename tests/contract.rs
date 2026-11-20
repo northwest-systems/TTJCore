@@ -586,6 +586,15 @@ async fn concurrent_changes_with_the_same_revision_commit_only_once() {
 
 #[tokio::test]
 async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
+    fn short_id(id: &Value, prefix: &str) {
+        let suffix = id.as_str().unwrap().strip_prefix(prefix).unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(
+            suffix
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+    }
     async fn auto(db: &Store, method: &str, p: Value) -> ttjcore::Result<Value> {
         change(db, method, p)
             .await
@@ -596,7 +605,7 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     let request = json!({"operation":"auto-project","record":{"name":"Automatic IDs"}});
     let project = auto(&db, "project.create", request.clone()).await.unwrap();
     assert_eq!(project, auto(&db, "project.create", request).await.unwrap());
-    uuid::Uuid::parse_str(project["record"]["id"].as_str().unwrap()).unwrap();
+    short_id(&project["record"]["id"], "pj-");
     let task = auto(
         &db,
         "task.create",
@@ -605,15 +614,20 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     )
     .await
     .unwrap();
+    short_id(&task["record"]["id"], "tsk-");
     let request = json!({"operation":"auto-ticket","display":{"summary":"Compact card"},
         "record":{"task":task["record"]["id"],"objective":"Review","jobs":[
         {"objective":"Prepare","criteria":["Ready"],"display":{"icon":"job"}},
         {"objective":"GitHub review","criteria":["Approved"],"display":{"icon":"github"}}]}});
     let ticket = auto(&db, "ticket.create", request.clone()).await.unwrap();
     assert_eq!(ticket, auto(&db, "ticket.create", request).await.unwrap());
+    short_id(&ticket["record"]["id"], "tkt-");
     assert_eq!(ticket["display"]["summary"], "Compact card");
     assert!(ticket["record"].get("summary").is_none());
     let ids = ticket["record"]["jobs"].as_array().unwrap();
+    for id in ids {
+        short_id(id, "job-");
+    }
     assert_ne!(ids[0], ids[1]);
     let job = get(&db, "job", ids[1].as_str().unwrap()).await;
     assert_eq!(job["display"]["icon"], "github");
@@ -630,8 +644,28 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     let first = get(&db, "job", ids[0].as_str().unwrap()).await;
     let start = json!({"operation":"auto-run","job":ids[0],"revision":first["revision"]});
     let run = auto(&db, "run.start", start.clone()).await.unwrap();
-    uuid::Uuid::parse_str(run["run"]["record"]["id"].as_str().unwrap()).unwrap();
+    short_id(&run["run"]["record"]["id"], "");
     assert_eq!(run, auto(&db, "run.start", start).await.unwrap());
+    let knowledge = auto(
+        &db,
+        "knowledge.create",
+        json!({"record":{"project":project["record"]["id"],"content":"Short IDs","basis":"Contract test"}}),
+    )
+    .await
+    .unwrap();
+    short_id(&knowledge["record"]["id"], "");
+    let all_ids = [
+        &project["record"]["id"],
+        &task["record"]["id"],
+        &ticket["record"]["id"],
+        &ids[0],
+        &ids[1],
+        &run["run"]["record"]["id"],
+        &knowledge["record"]["id"],
+    ];
+    let unique: std::collections::BTreeSet<_> =
+        all_ids.iter().map(|id| id.as_str().unwrap()).collect();
+    assert_eq!(unique.len(), all_ids.len());
     assert!(
         auto(
             &db,
@@ -640,5 +674,139 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
         )
         .await
         .is_err()
+    );
+}
+
+#[tokio::test]
+async fn legacy_ids_remain_usable_with_short_ids_and_reserved_after_deletion() {
+    let db = db().await;
+    let legacy = "550e8400-e29b-41d4-a716-446655440000";
+    change(
+        &db,
+        "project.create",
+        json!({"record":{"id":legacy,"name":"Legacy"}}),
+    )
+    .await
+    .unwrap();
+    let request = json!({"operation":"mixed-task","record":{"project":legacy,"objective":"Mixed IDs","criteria":["References preserved"]}});
+    let task = change(&db, "task.create", request.clone()).await.unwrap();
+    assert_eq!(task, change(&db, "task.create", request).await.unwrap());
+    let task_id = task["value"]["record"]["id"].as_str().unwrap();
+    assert!(task_id.starts_with("tsk-"));
+    let snapshot = db
+        .call("project.snapshot", json!({"id":legacy}))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["tasks"][0]["task"]["record"]["project"], legacy);
+    assert_eq!(snapshot["tasks"][0]["task"]["record"]["id"], task_id);
+    assert!(
+        change(
+            &db,
+            "ticket.create",
+            json!({"record":{"id":"same-id","task":task_id,"objective":"Invalid duplicate","jobs":[
+        {"id":"same-id","objective":"Duplicate","criteria":["Rejected"]}]}})
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        db.call("ticket.get", json!({"id":"same-id"}))
+            .await
+            .is_err()
+    );
+    let row = get(&db, "task", task_id).await;
+    change(
+        &db,
+        "status.set",
+        json!({"id":task_id,"revision":row["revision"],"status":"canceled"}),
+    )
+    .await
+    .unwrap();
+    let row = get(&db, "task", task_id).await;
+    change(
+        &db,
+        "task.delete",
+        json!({"id":task_id,"revision":row["revision"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        change(
+            &db,
+            "project.create",
+            json!({"record":{"id":task_id,"name":"Reserved"}})
+        )
+        .await
+        .unwrap_err()
+        .code,
+        -32009
+    );
+    assert_eq!(get(&db, "project", legacy).await["record"]["id"], legacy);
+}
+
+#[tokio::test]
+async fn snapshot_resolves_current_and_historical_dependencies_across_projects_and_deletion() {
+    let db = db().await;
+    seed(&db).await;
+    change(
+        &db,
+        "project.create",
+        json!({"record":{"id":"other-project","name":"Other"}}),
+    )
+    .await
+    .unwrap();
+    change(&db,"task.create",json!({"record":{"id":"other-task","project":"other-project","objective":"Approval","criteria":["Approved"]}})).await.unwrap();
+    change(&db,"ticket.create",json!({"record":{"id":"external","task":"other-task","objective":"External approval","jobs":[
+        {"id":"external-job","objective":"Approve","criteria":["Reviewed"]}]}})).await.unwrap();
+    ticket(&db, "unrelated", &["unrelated-job"], &[]).await;
+    ticket(&db, "local", &["local-job"], &["external"]).await;
+    let snapshot = db
+        .call("project.snapshot", json!({"id":"p"}))
+        .await
+        .unwrap();
+    let dependencies = snapshot["dependencies"].as_array().unwrap();
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies[0]["record"]["objective"], "External approval");
+    assert_eq!(dependencies[0]["deleted"], false);
+    start(&db, "external-job", "external-run").await.unwrap();
+    finish(&db, "external-run").await.unwrap();
+    complete(&db, "external-job").await;
+    let row = get(&db, "ticket", "external").await;
+    change(
+        &db,
+        "ticket.delete",
+        json!({"id":"external","revision":row["revision"]}),
+    )
+    .await
+    .unwrap();
+    let snapshot = db
+        .call("project.snapshot", json!({"id":"p"}))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["dependencies"][0]["deleted"], true);
+    assert_eq!(
+        snapshot["dependencies"][0]["record"]["objective"],
+        "External approval"
+    );
+    let row = get(&db, "ticket", "local").await;
+    change(
+        &db,
+        "ticket.update",
+        json!({"id":"local","revision":row["revision"],"patch":{"depends":[]}}),
+    )
+    .await
+    .unwrap();
+    let snapshot = db
+        .call("project.snapshot", json!({"id":"p"}))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["dependencies"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["dependencies"][0]["record"]["id"], "external");
+    assert!(
+        snapshot["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["from"]["record"]["depends"] == json!(["external"]))
     );
 }

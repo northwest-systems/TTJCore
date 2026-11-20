@@ -12,7 +12,7 @@ use sea_orm::{
     sea_query::{Expr, OnConflict},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub struct Store {
@@ -308,6 +308,7 @@ fn read(
             return Err(invalid("id must identify a Project"));
         }
         let mut tasks = vec![];
+        let mut dependency_ids = BTreeSet::new();
         for task in engine.rows.values().filter(|r| {
             r.kind == "task" && !r.deleted && r.parent.as_deref() == Some(project.id.as_str())
         }) {
@@ -315,6 +316,7 @@ fn read(
             for ticket in engine.rows.values().filter(|r| {
                 r.kind == "ticket" && !r.deleted && r.parent.as_deref() == Some(task.id.as_str())
             }) {
+                dependency_ids.extend(strings(&ticket.body, "depends", false)?);
                 let jobs: Vec<_> = strings(&ticket.body, "jobs", true)?
                     .iter()
                     .filter_map(|id| engine.rows.get(id))
@@ -335,8 +337,23 @@ fn read(
             })
             .map(view)
             .collect();
+        let timeline = timeline(&project.id, &events);
+        for event in timeline.as_array().unwrap() {
+            for side in ["from", "to"] {
+                if let Some(depends) = event[side]["record"]["depends"].as_array() {
+                    dependency_ids
+                        .extend(depends.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+        }
+        let dependencies: Vec<_> = dependency_ids
+            .iter()
+            .filter_map(|id| engine.rows.get(id))
+            .filter(|row| row.kind == "ticket")
+            .map(view)
+            .collect();
         return Ok(
-            json!({"project":view(&project),"tasks":tasks,"timeline":timeline(&project.id,&events),"knowledge":knowledge}),
+            json!({"project":view(&project),"tasks":tasks,"timeline":timeline,"knowledge":knowledge,"dependencies":dependencies}),
         );
     }
     let (kind, action) = method
@@ -449,7 +466,7 @@ pub fn discover() -> Value {
             "depends":"Array of Ticket IDs",
             "handoffs":"Array of short strings",
             "deadline":"Timezone-qualified RFC 3339 datetime",
-            "id":"Globally unique non-empty string; UUID generated on create/run.start when omitted",
+            "id":"Globally unique non-empty string; when omitted, 8 lowercase alphanumeric characters with pj-/tsk-/tkt-/job- prefixes for Project/Task/Ticket/Job; Run/Knowledge have no prefix",
             "revision":"Integer returned by the latest read"
         },
         "editable_fields":{

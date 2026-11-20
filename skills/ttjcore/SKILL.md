@@ -5,7 +5,9 @@ description: TTJCoreでProject・Task・Ticket・Job・Run・Knowledgeを管理�
 
 # TTJCore
 
-利用契約は[protocol](references/protocol.md)を読む。接続・method・record・event・errorをこの文書から確認し、実機の`ttjcore methods`で対応methodとfieldを確認する。
+計画・依存・実行・完了判定・申し送りの規則は、同梱の[TTJ 1.0.0規格本文](references/ttj-1.0.0/specification.md)を読む。記入項目と例は[JSON参照形式](references/ttj-1.0.0/json-format.md)で確認する。これらは[TTJ v1.0.0](https://github.com/northwest-systems/TTJ/tree/v1.0.0)の固定版を同梱しており、ネット接続や別のTTJ skillの設置なしで参照できる。[ライセンス](references/ttj-1.0.0/LICENSE)も同梱する。
+
+Coreの利用契約は[protocol](references/protocol.md)を読む。接続・method・record・event・errorをこの文書から確認し、実機の`ttjcore methods`で対応methodとfieldを確認する。
 
 Coreへ直接接続する。標準接続では`ttjcore ensure`で準備し、custom profileでは全コマンドに同じ`--home <data-dir>`を指定する。`project.list`から対象Projectを選び、`project.snapshot`でTask・Ticket・Job・Knowledgeとtimelineを取得する。
 

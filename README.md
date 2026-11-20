@@ -7,7 +7,7 @@
 
 ## 概要
 
-[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、ProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.0です。
+[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、ProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.1です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
@@ -20,7 +20,7 @@ Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticke
 ```sh
 git clone https://github.com/northwest-systems/TTJCore.git
 cd TTJCore
-git checkout v0.1.0
+git checkout v0.1.1
 cargo install --path . --locked
 ttjcore ensure
 ttjcore call project.list
@@ -47,6 +47,10 @@ TTJCore/                        # Rust製CLI・Core
 ├── skills/                     # LLM向け利用スキル
 │   └── ttjcore/                # Coreの利用スキル
 │       ├── references/         # 仕様の参照資料
+│       │   ├── ttj-1.0.0/      # オフラインで読む固定版のTTJ規格
+│       │   │   ├── json-format.md    # TTJの項目と記入例
+│       │   │   ├── LICENSE           # TTJ規格のApache-2.0ライセンス
+│       │   │   └── specification.md  # TTJ 1.0.0の作業規則
 │       │   └── protocol.md     # CLI・JSON-RPC・eventの仕様
 │       └── SKILL.md            # LLM向けの操作手順
 ├── src/                        # Rustソース
@@ -114,6 +118,8 @@ DB設定はensure・init・serveが使います。call・rpc・Herdrは同じpro
 ## API・LLMからの利用
 
 CLI・JSON-RPC・eventの仕様は[protocol](skills/ttjcore/references/protocol.md)、LLM向けの入口は[skills/ttjcore/SKILL.md](skills/ttjcore/SKILL.md)です。
+
+Skillには[TTJ 1.0.0規格本文](skills/ttjcore/references/ttj-1.0.0/specification.md)・[JSON参照形式](skills/ttjcore/references/ttj-1.0.0/json-format.md)とライセンスを固定版として同梱しています。`skills/ttjcore`を参照資料ごとコピーすれば、ネット接続なしでTTJの規則とCoreの操作を確認できます。
 
 ## テスト
 
