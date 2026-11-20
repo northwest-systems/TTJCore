@@ -1,6 +1,6 @@
 # TTJCore protocol
 
-TTJCore 0.1.0のCLI・JSON-RPC contractです。`protocol`は`TTJ/1.0.0`です。LLMとHerdrはCoreへ直接接続し、この文書と`ttjcore methods`でinterfaceを確認します。
+TTJCore 0.1.1のCLI・JSON-RPC contractです。`protocol`は`TTJ/1.0.0`です。LLMとHerdrはCoreへ直接接続し、この文書と`ttjcore methods`でinterfaceを確認します。
 
 TTJ自体の作業規則は同梱の[TTJ 1.0.0規格本文](ttj-1.0.0/specification.md)、項目と例は[JSON参照形式](ttj-1.0.0/json-format.md)を参照します。いずれもネット接続なしで読めます。
 
