@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait};
 use serde_json::{Value, json};
 use ttjcore::{
     entity::{history, operation, record},
@@ -83,6 +83,20 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
     )
     .await
     .unwrap();
+    for event in history::Entity::find().all(&db.db).await.unwrap() {
+        let without_kind = |value: Option<Value>| {
+            value.map(|mut wrapper| {
+                wrapper.as_object_mut().unwrap().remove("kind");
+                wrapper
+            })
+        };
+        let before = without_kind(event.before.clone());
+        let after = without_kind(event.after.clone());
+        let mut model: history::ActiveModel = event.into();
+        model.before = Set(before);
+        model.after = Set(after);
+        model.update(&db.db).await.unwrap();
+    }
     db.db
         .execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
         .await
@@ -118,6 +132,25 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
         .call("timeline.list", json!({"project":"project"}))
         .await
         .unwrap();
+    for (target, kind) in [
+        ("task", "task"),
+        ("ticket", "ticket"),
+        ("job", "job"),
+        ("run", "run"),
+        ("project", "project"),
+        ("knowledge", "knowledge"),
+    ] {
+        let events: Vec<_> = timeline
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["target"] == target)
+            .collect();
+        assert!(events.iter().all(|event| event["kind"] == kind));
+        if ["task", "ticket", "job", "run"].contains(&target) {
+            assert!(events.iter().all(|event| event["to"]["kind"] == kind));
+        }
+    }
     assert!(!timeline.to_string().contains("ARCHIVED_DETAIL_"));
     assert!(
         timeline

@@ -41,7 +41,7 @@ pub fn terminal(body: &Value) -> bool {
     matches!(body["status"].as_str(), Some("completed" | "canceled"))
 }
 pub fn view(row: &record::Model) -> Value {
-    json!({"record":row.body,"revision":row.revision,"deleted":row.deleted,
+    json!({"kind":row.kind,"record":row.body,"revision":row.revision,"deleted":row.deleted,
         "started":row.started,"active":row.active,"constraints":row.flags,
         "display":row.flags.get("display").cloned().unwrap_or(json!({}))})
 }
@@ -60,7 +60,7 @@ pub fn history_summary(value: Value) -> Value {
             body.insert(key.into(), field.clone());
         }
     }
-    json!({"record":body,"revision":value["revision"],"deleted":value["deleted"],
+    json!({"kind":value["kind"],"record":body,"revision":value["revision"],"deleted":value["deleted"],
         "summary":true,"physical":value["constraints"]["physical"] == true})
 }
 pub struct Change {

@@ -98,7 +98,9 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成�
 
 `<kind>`は`project`・`task`・`ticket`・`job`・`run`・`knowledge`です。削除済みをget・list・timeline.listで読む場合は`include_deleted:true`を指定します。
 
-record wrapperには`record, revision, deleted, started, active, constraints, display`が入ります。`record`がTTJの内容です。変更responseの`result.operation`がoperation ID、`result.value`が変更結果です。`run.start`のvalueは`run`・`job`のwrapperを含みます。
+record wrapperには`kind, record, revision, deleted, started, active, constraints, display`が入ります。`kind`は対象の種類、`record`がTTJの内容です。変更responseの`result.operation`がoperation ID、`result.value`が変更結果です。`run.start`のvalueは`run`・`job`のwrapperを含みます。
+
+`timeline.list`とsnapshotの`timeline`には、各履歴の対象種別を`kind`で返します。値は`project`・`task`・`ticket`・`job`・`run`・`knowledge`です。物理削除後の要約履歴にも種別を保持します。
 
 `project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotの`knowledge`はactiveなKnowledgeを返します。
 

@@ -156,6 +156,11 @@ impl Store {
             .map(|change| change.row.id.clone())
             .collect();
         if !purged.is_empty() {
+            let kinds: BTreeMap<_, _> = engine
+                .changes
+                .iter()
+                .map(|change| (change.row.id.clone(), change.row.kind.clone()))
+                .collect();
             let names: BTreeMap<_, _> = engine
                 .changes
                 .iter()
@@ -175,6 +180,7 @@ impl Store {
             {
                 let summarize = |value| {
                     let mut summary = history_summary(value);
+                    summary["kind"] = json!(kinds.get(&event.target));
                     if summary["record"].get("objective").is_none() {
                         if let Some(name) = names.get(&event.target) {
                             summary["record"]["objective"] = name.clone();
@@ -418,7 +424,7 @@ fn read(
         if row.kind != "project" {
             return Err(invalid("project must identify a Project"));
         }
-        return Ok(timeline(&project, &events));
+        return Ok(timeline(&project, &events, &engine.rows));
     }
     if method == "project.snapshot" {
         let project = engine.get(&text(p, "id")?)?;
@@ -455,7 +461,7 @@ fn read(
             })
             .map(view)
             .collect();
-        let timeline = timeline(&project.id, &events);
+        let timeline = timeline(&project.id, &events, &engine.rows);
         for event in timeline.as_array().unwrap() {
             for side in ["from", "to"] {
                 if let Some(depends) = event[side]["record"]["depends"].as_array() {
@@ -533,13 +539,20 @@ fn read(
     }
     Err(invalid("Unknown read operation"))
 }
-fn timeline(project: &str, events: &[history::Model]) -> Value {
+fn timeline(
+    project: &str,
+    events: &[history::Model],
+    rows: &BTreeMap<String, record::Model>,
+) -> Value {
     json!(
         events
             .iter()
             .filter(|e| e.project == project)
             .map(|e| json!({
                 "id":e.id,"operation":e.operation,"target":e.target,"event":e.event,
+                "kind":rows.get(&e.target).map(|row|row.kind.as_str())
+                    .or_else(||e.after.as_ref().and_then(|value|value["kind"].as_str()))
+                    .or_else(||e.before.as_ref().and_then(|value|value["kind"].as_str())),
                 "actor":e.actor,"timestamp":e.timestamp,"reason":e.reason,"revision":e.revision,
                 "from":e.before,"to":e.after
             }))
