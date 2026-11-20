@@ -279,14 +279,51 @@ impl Engine {
         }
         Ok(())
     }
-    fn assign_id(body: &mut Value) -> Result<()> {
+    fn assign_id(
+        &self,
+        kind: &str,
+        body: &mut Value,
+        reserved: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        self.assign_id_with(kind, body, reserved, || uuid::Uuid::new_v4().as_u128())
+    }
+    fn assign_id_with(
+        &self,
+        kind: &str,
+        body: &mut Value,
+        reserved: &mut BTreeSet<String>,
+        mut random: impl FnMut() -> u128,
+    ) -> Result<()> {
         if !body.is_object() {
             return Err(invalid("record must be an object"));
         }
         if body.get("id").is_none() {
-            body["id"] = json!(uuid::Uuid::new_v4().to_string());
+            let prefix = match kind {
+                "project" => "pj-",
+                "task" => "tsk-",
+                "ticket" => "tkt-",
+                "job" => "job-",
+                _ => "",
+            };
+            loop {
+                let mut random = random();
+                let mut id = prefix.to_owned();
+                for _ in 0..8 {
+                    id.push(
+                        b"0123456789abcdefghijklmnopqrstuvwxyz"[(random % 36) as usize] as char,
+                    );
+                    random /= 36;
+                }
+                if !self.rows.contains_key(&id) && !reserved.contains(&id) {
+                    body["id"] = json!(id);
+                    break;
+                }
+            }
         }
-        text(body, "id")?;
+        let id = text(body, "id")?;
+        if self.rows.contains_key(&id) || !reserved.insert(id) {
+            return Err(conflict());
+        }
         Ok(())
     }
     fn display(value: Option<&Value>) -> Result<Value> {
@@ -306,7 +343,17 @@ impl Engine {
             .get("record")
             .cloned()
             .ok_or_else(|| invalid("record is required"))?;
-        Self::assign_id(&mut body)?;
+        let mut reserved = BTreeSet::new();
+        if kind == "ticket" {
+            if let Some(jobs) = body.get("jobs").and_then(Value::as_array) {
+                for job in jobs {
+                    if job.get("id").is_some() && !reserved.insert(text(job, "id")?) {
+                        return Err(conflict());
+                    }
+                }
+            }
+        }
+        self.assign_id(kind, &mut body, &mut reserved)?;
         let display = Self::display(p.get("display"))?;
         let mut jobs = vec![];
         let mut job_displays = vec![];
@@ -354,7 +401,10 @@ impl Engine {
                     })?;
                 let mut ids = vec![];
                 for job in &mut jobs {
-                    Self::assign_id(job)?;
+                    if job.get("id").is_some() {
+                        reserved.remove(&text(job, "id")?);
+                    }
+                    self.assign_id("job", job, &mut reserved)?;
                     let display = job.as_object_mut().unwrap().remove("display");
                     job_displays.push(Self::display(display.as_ref())?);
                     Self::allowed(
@@ -363,9 +413,6 @@ impl Engine {
                     )?;
                     Self::validate("job", job)?;
                     let id = text(job, "id")?;
-                    if ids.contains(&id) || self.rows.contains_key(&id) {
-                        return Err(conflict());
-                    }
                     if let Some(instructions) = job.get("instructions") {
                         if !instructions.is_string() {
                             return Err(invalid("instructions must be a string"));
@@ -851,7 +898,7 @@ impl Engine {
         if let Some(id) = p.get("id") {
             run_id["id"] = id.clone();
         }
-        Self::assign_id(&mut run_id)?;
+        self.assign_id("run", &mut run_id, &mut BTreeSet::new())?;
         let body = json!({"id":run_id["id"],"job":job.id,"actor":self.actor,"started":self.now,"generation":generation});
         let id = self.insert("run", Some(job.id.clone()), body, json!({}))?;
         let mut run = self.get(&id)?;
@@ -955,5 +1002,61 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_skip_deleted_and_reserved_records() {
+        let deleted = record::Model {
+            id: "job-00000000".into(),
+            kind: "job".into(),
+            parent: None,
+            body: json!({"id":"job-00000000"}),
+            revision: 1,
+            started: false,
+            deleted: true,
+            active: false,
+            flags: json!({}),
+        };
+        let engine = Engine {
+            rows: BTreeMap::from([(deleted.id.clone(), deleted)]),
+            changes: vec![],
+            actor: vec!["operator".into()],
+            reason: "Test ID reservation".into(),
+            now: "2026-01-01T00:00:00Z".into(),
+        };
+        let mut reserved = BTreeSet::from(["job-10000000".into()]);
+        let mut body = json!({});
+        let mut attempts = 0;
+        engine
+            .assign_id_with("job", &mut body, &mut reserved, || {
+                let candidate = attempts;
+                attempts += 1;
+                candidate
+            })
+            .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(body["id"], "job-20000000");
+        assert!(reserved.contains("job-20000000"));
+        for id in ["job-00000000", "job-10000000", "job-20000000"] {
+            assert_eq!(
+                engine
+                    .assign_id("job", &mut json!({"id":id}), &mut reserved)
+                    .unwrap_err()
+                    .code,
+                -32009
+            );
+        }
+        let mut legacy = json!({"id":"550e8400-e29b-41d4-a716-446655440000"});
+        engine
+            .assign_id_with("job", &mut legacy, &mut reserved, || {
+                panic!("explicit IDs must not be regenerated")
+            })
+            .unwrap();
+        assert_eq!(legacy["id"], "550e8400-e29b-41d4-a716-446655440000");
     }
 }

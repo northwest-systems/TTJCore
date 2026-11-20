@@ -2,6 +2,8 @@
 
 TTJCore 0.1.0のCLI・JSON-RPC contractです。`protocol`は`TTJ/1.0.0`です。LLMとHerdrはCoreへ直接接続し、この文書と`ttjcore methods`でinterfaceを確認します。
 
+TTJ自体の作業規則は同梱の[TTJ 1.0.0規格本文](ttj-1.0.0/specification.md)、項目と例は[JSON参照形式](ttj-1.0.0/json-format.md)を参照します。いずれもネット接続なしで読めます。
+
 ## 接続とCLI
 
 CoreはDBへの接続を所有します。clientとの通信はWindowsではnamed pipe、Linux・macOSではUnix domain socketです。TCPポートは開きません。
@@ -54,7 +56,7 @@ responseにはrequestと同じ`protocol`・`id`、および`result`または`err
 
 Project → Task → Ticket → Jobの階層を持ち、RunはJobに属します。Ticketは1つのTaskに所属します。KnowledgeはProjectに属します。
 
-create入力のfieldは次のとおりです。`id`は共通のoptional fieldで、省略するとCoreがUUIDを発行します。削除済みを含む全recordと重複するIDは拒否します。
+create入力のfieldは次のとおりです。`id`は共通のoptional fieldで、省略するとCoreが小文字英数字8桁を発行します。Project・Task・Ticket・Jobにはそれぞれ`pj-`・`tsk-`・`tkt-`・`job-`を付けます（例：`tsk-12abcd00`）。Run・Knowledgeには接頭辞を付けません。自動発行で既存・削除済み・同時作成のIDと衝突した場合は再生成します。既存のUUIDや明示指定のIDはそのまま使用でき、削除済みを含む全recordと重複する指定IDは拒否します。
 
 | record | required field | optional field |
 |---|---|---|
@@ -86,7 +88,7 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成�
 | `<kind>.create` | `actor, reason, record`。Job・Runを除く |
 | `<kind>.update` | `actor, reason, id, revision, patch`。Runを除く |
 | `<kind>.delete` | `actor, reason, id, revision`。Job・Runを除く |
-| `project.snapshot` | Projectの`id`。`project, tasks, timeline, knowledge, cursor`を返す |
+| `project.snapshot` | Projectの`id`。`project, tasks, timeline, knowledge, dependencies, cursor`を返す |
 | `timeline.list` | `project`。履歴の配列を返す |
 | `status.set` | `actor, reason, id, revision, status` |
 | `run.start` | `actor, reason, job, revision`。revisionはJobの値 |
@@ -98,6 +100,8 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成�
 record wrapperには`record, revision, deleted, started, active, constraints, display`が入ります。`record`がTTJの内容です。変更responseの`result.operation`がoperation ID、`result.value`が変更結果です。`run.start`のvalueは`run`・`job`のwrapperを含みます。
 
 `project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotの`knowledge`はactiveなKnowledgeを返します。
+
+`dependencies`は、現在のTicketとtimelineの`depends`が参照するTicketのwrapper配列です。別Project・削除済みの参照先も含め、UIは`record.objective`を表示名に使えます。既存の`tasks`・`timeline`の構造は変わりません。
 
 ## CRUDと再送
 
