@@ -11,7 +11,7 @@
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
-Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。削除は履歴・依存参照を残す論理削除です。
+Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。終了したTaskは`task.purge`で配下を一括物理削除し、要約履歴とProjectのKnowledgeを残せます。既存の`delete`操作は履歴・依存参照を残す論理削除です。
 
 ## クイックスタート
 
@@ -65,6 +65,7 @@ TTJCore/                        # Rust製CLI・Core
 ├── tests/                      # 自動テスト
 │   ├── contract.rs             # SQLite・PostgreSQLの動作契約
 │   ├── ipc.rs                  # IPC経由の呼び出し
+│   ├── purge.rs                # Task物理削除・要約履歴・容量回収
 │   └── startup.rs              # Coreの自動起動・停止
 ├── .gitignore                  # Gitの除外設定
 ├── Cargo.lock                  # 依存crateのバージョン固定

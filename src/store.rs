@@ -1,6 +1,6 @@
 use crate::{
     PROTOCOL, Result, conflict,
-    engine::{Engine, strings, text, view},
+    engine::{Engine, history_summary, strings, text, view},
     entity::{history, meta, operation, record},
     invalid, rule,
 };
@@ -8,7 +8,7 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Schema, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Schema, Statement, TransactionTrait,
     sea_query::{Expr, OnConflict},
 };
 use serde_json::{Value, json};
@@ -100,7 +100,11 @@ impl Store {
             });
         }
         let actor = strings(&params, "actor", true)?;
-        let reason = text(&params, "reason")?;
+        let reason = if method == "task.purge" && params.get("reason").is_none() {
+            "Taskを削除".to_owned()
+        } else {
+            text(&params, "reason")?
+        };
         let op = match params.get("operation") {
             Some(_) => text(&params, "operation")?,
             None => uuid::Uuid::new_v4().to_string(),
@@ -121,20 +125,96 @@ impl Store {
                 return Err(conflict());
             }
             tx.rollback().await?;
-            return Ok(existing.response);
+            return Ok(self.reclaim_task_space(existing.response).await);
         }
         let rows = record::Entity::find().all(&tx).await?;
+        let reserved_ids = history::Entity::find()
+            .select_only()
+            .column(history::Column::Target)
+            .distinct()
+            .into_tuple::<String>()
+            .all(&tx)
+            .await?
+            .into_iter()
+            .collect();
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|_| rule("Clock formatting failed"))?;
         let mut engine = Engine {
             rows: rows.into_iter().map(|r| (r.id.clone(), r)).collect(),
+            reserved_ids,
             changes: vec![],
             actor: actor.clone(),
             reason: reason.clone(),
             now: now.clone(),
         };
         let value = engine.apply(method, &params)?;
+        let purged: BTreeSet<_> = engine
+            .changes
+            .iter()
+            .filter(|change| change.row.flags["physical"] == true)
+            .map(|change| change.row.id.clone())
+            .collect();
+        if !purged.is_empty() {
+            let kinds: BTreeMap<_, _> = engine
+                .changes
+                .iter()
+                .map(|change| (change.row.id.clone(), change.row.kind.clone()))
+                .collect();
+            let names: BTreeMap<_, _> = engine
+                .changes
+                .iter()
+                .filter_map(|change| {
+                    change
+                        .row
+                        .body
+                        .get("objective")
+                        .cloned()
+                        .map(|name| (change.row.id.clone(), name))
+                })
+                .collect();
+            for event in history::Entity::find()
+                .filter(history::Column::Target.is_in(purged.iter().cloned()))
+                .all(&tx)
+                .await?
+            {
+                let summarize = |value| {
+                    let mut summary = history_summary(value);
+                    summary["kind"] = json!(kinds.get(&event.target));
+                    if summary["record"].get("objective").is_none() {
+                        if let Some(name) = names.get(&event.target) {
+                            summary["record"]["objective"] = name.clone();
+                        }
+                    }
+                    summary
+                };
+                let before = event.before.clone().map(summarize);
+                let after = event.after.clone().map(summarize);
+                let mut model: history::ActiveModel = event.into();
+                model.before = Set(before);
+                model.after = Set(after);
+                model.update(&tx).await?;
+            }
+            for operation in operation::Entity::find().all(&tx).await? {
+                let response = &operation.response["value"];
+                let affected = [
+                    &operation.request["params"]["id"],
+                    &operation.request["params"]["job"],
+                    &response["record"]["id"],
+                    &response["run"]["record"]["id"],
+                    &response["job"]["record"]["id"],
+                ]
+                .iter()
+                .filter_map(|value| value.as_str())
+                .any(|id| purged.contains(id));
+                if affected {
+                    let mut model: operation::ActiveModel = operation.into();
+                    model.request = Set(json!({"purged":true}));
+                    model.response = Set(json!({"purged":true}));
+                    model.update(&tx).await?;
+                }
+            }
+        }
         let mut changed_cursor = None;
         for change in engine.changes {
             let row = change.row;
@@ -149,23 +229,29 @@ impl Store {
                 active: Set(row.active),
                 flags: Set(row.flags.clone()),
             };
-            record::Entity::insert(model)
-                .on_conflict(
-                    OnConflict::column(record::Column::Id)
-                        .update_columns([
-                            record::Column::Kind,
-                            record::Column::Parent,
-                            record::Column::Body,
-                            record::Column::Revision,
-                            record::Column::Started,
-                            record::Column::Deleted,
-                            record::Column::Active,
-                            record::Column::Flags,
-                        ])
-                        .to_owned(),
-                )
-                .exec(&tx)
-                .await?;
+            if row.flags["physical"] == true {
+                record::Entity::delete_by_id(row.id.clone())
+                    .exec(&tx)
+                    .await?;
+            } else {
+                record::Entity::insert(model)
+                    .on_conflict(
+                        OnConflict::column(record::Column::Id)
+                            .update_columns([
+                                record::Column::Kind,
+                                record::Column::Parent,
+                                record::Column::Body,
+                                record::Column::Revision,
+                                record::Column::Started,
+                                record::Column::Deleted,
+                                record::Column::Active,
+                                record::Column::Flags,
+                            ])
+                            .to_owned(),
+                    )
+                    .exec(&tx)
+                    .await?;
+            }
             let event = history::ActiveModel {
                 operation: Set(op.clone()),
                 project: Set(change.project),
@@ -176,7 +262,11 @@ impl Store {
                 reason: Set(reason.clone()),
                 revision: Set(row.revision),
                 before: Set(change.before),
-                after: Set(Some(view(&row))),
+                after: Set(Some(if row.flags["physical"] == true {
+                    history_summary(view(&row))
+                } else {
+                    view(&row)
+                })),
                 ..Default::default()
             }
             .insert(&tx)
@@ -195,7 +285,37 @@ impl Store {
         if let Some(cursor) = changed_cursor {
             let _ = self.changes.send(cursor);
         }
-        Ok(response)
+        Ok(self.reclaim_task_space(response).await)
+    }
+    async fn reclaim_task_space(&self, mut response: Value) -> Value {
+        if response["value"]["physical"] == true {
+            response["value"]["storage"] =
+                if self.db.get_database_backend() == sea_orm::DbBackend::Sqlite {
+                    let vacuum = self.db.execute_unprepared("VACUUM").await.is_ok();
+                    let checkpoint = if vacuum {
+                        self.db
+                            .query_one(Statement::from_string(
+                                sea_orm::DbBackend::Sqlite,
+                                "PRAGMA wal_checkpoint(TRUNCATE)".to_owned(),
+                            ))
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|row| row.try_get::<i64>("", "busy").ok())
+                            == Some(0)
+                    } else {
+                        false
+                    };
+                    json!(if vacuum && checkpoint {
+                        "reclaimed"
+                    } else {
+                        "pending"
+                    })
+                } else {
+                    json!("reusable")
+                };
+        }
+        response
     }
 }
 impl Store {
@@ -258,6 +378,9 @@ impl Store {
 }
 
 fn is_mutation(method: &str) -> bool {
+    if method == "task.purge" {
+        return true;
+    }
     if matches!(method, "status.set" | "run.start" | "run.finish") {
         return true;
     }
@@ -278,6 +401,7 @@ fn read(
             .into_iter()
             .map(|r| (r.id.clone(), r))
             .collect::<BTreeMap<_, _>>(),
+        reserved_ids: BTreeSet::new(),
         changes: vec![],
         actor: vec![],
         reason: String::new(),
@@ -300,7 +424,7 @@ fn read(
         if row.kind != "project" {
             return Err(invalid("project must identify a Project"));
         }
-        return Ok(timeline(&project, &events));
+        return Ok(timeline(&project, &events, &engine.rows));
     }
     if method == "project.snapshot" {
         let project = engine.get(&text(p, "id")?)?;
@@ -337,7 +461,7 @@ fn read(
             })
             .map(view)
             .collect();
-        let timeline = timeline(&project.id, &events);
+        let timeline = timeline(&project.id, &events, &engine.rows);
         for event in timeline.as_array().unwrap() {
             for side in ["from", "to"] {
                 if let Some(depends) = event[side]["record"]["depends"].as_array() {
@@ -348,9 +472,17 @@ fn read(
         }
         let dependencies: Vec<_> = dependency_ids
             .iter()
-            .filter_map(|id| engine.rows.get(id))
-            .filter(|row| row.kind == "ticket")
-            .map(view)
+            .filter_map(|id| {
+                if let Some(row) = engine.rows.get(id) {
+                    return (row.kind == "ticket").then(|| view(row));
+                }
+                let event = events.iter().rev().find(|event| event.target == *id)?;
+                let mut summary = event.after.clone().or_else(|| event.before.clone())?;
+                summary["deleted"] = json!(true);
+                summary["physical"] = json!(true);
+                summary["active"] = json!(false);
+                Some(summary)
+            })
             .collect();
         return Ok(
             json!({"project":view(&project),"tasks":tasks,"timeline":timeline,"knowledge":knowledge,"dependencies":dependencies}),
@@ -407,13 +539,20 @@ fn read(
     }
     Err(invalid("Unknown read operation"))
 }
-fn timeline(project: &str, events: &[history::Model]) -> Value {
+fn timeline(
+    project: &str,
+    events: &[history::Model],
+    rows: &BTreeMap<String, record::Model>,
+) -> Value {
     json!(
         events
             .iter()
             .filter(|e| e.project == project)
             .map(|e| json!({
                 "id":e.id,"operation":e.operation,"target":e.target,"event":e.event,
+                "kind":rows.get(&e.target).map(|row|row.kind.as_str())
+                    .or_else(||e.after.as_ref().and_then(|value|value["kind"].as_str()))
+                    .or_else(||e.before.as_ref().and_then(|value|value["kind"].as_str())),
                 "actor":e.actor,"timestamp":e.timestamp,"reason":e.reason,"revision":e.revision,
                 "from":e.before,"to":e.after
             }))
@@ -440,6 +579,8 @@ pub fn discover() -> Value {
         }
     }
     methods.extend([
+        json!({"name":"task.purge","mutates":true,"required":["actor","id","revision"],
+            "description":"Physically remove a terminal Task and all descendants; retain summary history and Knowledge; reject external Ticket references"}),
         json!({"name":"core.stop","mutates":false,"required":[],"transport":"IPC service control"}),
         json!({"name":"events.list","mutates":false,"required":[]}),
         json!({"name":"events.wait","mutates":false,"required":[]}),
