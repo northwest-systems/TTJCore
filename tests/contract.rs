@@ -466,7 +466,7 @@ async fn postgres_contract() {
     let task_row = get(&db, "task", &task).await;
     change(
         &db,
-        "task.delete",
+        "task.purge",
         json!({"id":task,"revision":task_row["revision"]}),
     )
     .await

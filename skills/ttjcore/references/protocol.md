@@ -91,6 +91,7 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。作成�
 | `project.snapshot` | Projectの`id`。`project, tasks, timeline, knowledge, dependencies, cursor`を返す |
 | `timeline.list` | `project`。履歴の配列を返す |
 | `status.set` | `actor, reason, id, revision, status` |
+| `task.purge` | `actor, id, revision`。終了したTaskと全配下を物理削除し要約履歴を保持 |
 | `run.start` | `actor, reason, job, revision`。revisionはJobの値 |
 | `run.finish` | `actor, reason, id, revision, result`。id・revisionはRunの値 |
 | `core.stop` | IPC・rpc経由でCoreを停止。recordの変更とは別の操作 |
@@ -119,7 +120,7 @@ Ticketの作成paramsの例:
 {"actor":["operator"],"reason":"作業計画を登録する","operation":"example-ticket-create","record":{"task":"<task-id>","objective":"案内を完成させる","jobs":[{"objective":"案内を書く","criteria":["必要事項がある"]},{"objective":"GitHubでreviewする","criteria":["review結果がある"],"display":{"icon":"github"}}]}}
 ```
 
-変更には`actor`・`reason`が必要です。`operation`は省略すると生成しますが、再送するclientは事前に固有の値を指定してください。同じoperationと同じrequestの再送は、生成済みIDを含む同じ結果を返します。同じoperationで内容を変えるとconflictになります。
+変更には`actor`・`reason`が必要です。`task.purge`はreasonを省略でき、削除操作として自動記録します。`operation`は省略すると生成しますが、再送するclientは事前に固有の値を指定してください。同じoperationと同じrequestの再送は、生成済みIDを含む同じ結果を返します。同じoperationで内容を変えるとconflictになります。物理削除の対象となった過去の操作は失効し、再送するとconflictになります。
 
 update・delete・status.set・Runの操作は直前のgetまたはsnapshotからrevisionを取得してください。conflict時は最新のrecordを読み、変更内容を判断し直します。
 
@@ -134,6 +135,20 @@ update・delete・status.set・Runの操作は直前のgetまたはsnapshotか�
 completed・canceledのrecordは変更できません。Ticketのdependsは実行開始後に変更できません。patchの未指定fieldは維持します。deadline・resume・assigneeをnullにするとfieldを除去し、空の配列は`[]`で指定します。
 
 削除は論理削除です。配下のTask・Ticket・Jobがすべてcompletedまたはcanceledである必要があり、履歴・ID・dependsの参照は残します。Jobは所属Ticketと一緒に削除し、Runの個別削除はできません。Task・Ticketを削除してもProjectのKnowledgeは残ります。
+
+### Taskの物理削除と容量回収
+
+`task.purge`はTask自身と配下のTicket・Jobがすべてcompletedまたはcanceledで、有効なRunがない場合に使います。対象Taskと全Ticket・Job・Runを同じtransactionで物理削除します。他TaskのTicketからdependsで参照されている場合は、削除済みのTicketからの参照も含めて拒否します。ProjectのKnowledgeは削除対象に含みません。
+
+```json
+{"actor":["operator"],"operation":"example-task-purge","id":"<task-id>","revision":7}
+```
+
+履歴は対象名・日時・操作者・理由・状態変化などの要約を残し、criteria・instructions・resultなどの詳しい内容を除きます。保持が必要な詳しい内容は、日々の作業でProjectのKnowledgeへ記録してください。対象の過去の再送request・responseは失効記録へ置き換え、古い再送による再作成を防ぎます。過去のIDは再利用しません。
+
+responseの`value`は`id, deleted:true, physical:true, records, storage`です。`records`は削除したrecord数です。SQLiteではcommit後にVACUUMとWALの回収を試み、`storage`を成功時は`reclaimed`、回収未完了なら`pending`にします。`pending`でもデータの削除はcommit済みです。同じpurge操作の再送は削除を重ねず、容量回収を再試行します。容量回収の結果だけは再送時に変わる場合があります。PostgreSQLでは`reusable`を返し、削除領域はDB側の再利用対象になります。DBファイルを縮める処理は行いません。
+
+既存の論理削除済みTaskも、`task.get`へ`include_deleted:true`を付けて最新revisionを取得すれば`task.purge`で整理できます。通常の一覧からは表示されません。物理削除後は`include_deleted:true`でもrecordを取得できず、要約履歴だけをtimelineから参照します。
 
 Knowledgeの`content`・`basis`を訂正する場合は、新しい`knowledge.create`の`supersedes`に旧IDを指定します。同じProjectのactiveなKnowledgeが対象です。旧recordはsupersedとなり、content・basisを保持します。activeなKnowledgeは削除できません。
 

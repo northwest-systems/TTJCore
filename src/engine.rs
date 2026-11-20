@@ -45,6 +45,24 @@ pub fn view(row: &record::Model) -> Value {
         "started":row.started,"active":row.active,"constraints":row.flags,
         "display":row.flags.get("display").cloned().unwrap_or(json!({}))})
 }
+pub fn history_summary(value: Value) -> Value {
+    let mut body = serde_json::Map::new();
+    for key in [
+        "id",
+        "name",
+        "objective",
+        "status",
+        "job",
+        "started",
+        "ended",
+    ] {
+        if let Some(field) = value["record"].get(key) {
+            body.insert(key.into(), field.clone());
+        }
+    }
+    json!({"record":body,"revision":value["revision"],"deleted":value["deleted"],
+        "summary":true,"physical":value["constraints"]["physical"] == true})
+}
 pub struct Change {
     pub row: record::Model,
     pub before: Option<Value>,
@@ -53,6 +71,7 @@ pub struct Change {
 }
 pub struct Engine {
     pub rows: BTreeMap<String, record::Model>,
+    pub reserved_ids: BTreeSet<String>,
     pub changes: Vec<Change>,
     pub actor: Vec<String>,
     pub reason: String,
@@ -314,14 +333,17 @@ impl Engine {
                     );
                     random /= 36;
                 }
-                if !self.rows.contains_key(&id) && !reserved.contains(&id) {
+                if !self.rows.contains_key(&id)
+                    && !self.reserved_ids.contains(&id)
+                    && !reserved.contains(&id)
+                {
                     body["id"] = json!(id);
                     break;
                 }
             }
         }
         let id = text(body, "id")?;
-        if self.rows.contains_key(&id) || !reserved.insert(id) {
+        if self.rows.contains_key(&id) || self.reserved_ids.contains(&id) || !reserved.insert(id) {
             return Err(conflict());
         }
         Ok(())
@@ -588,6 +610,79 @@ impl Engine {
             self.save(target, "record.deleted")?;
         }
         Ok(view(&self.raw(&row.id)?))
+    }
+    pub fn purge_task(&mut self, p: &Value) -> Result<Value> {
+        let row = self
+            .rows
+            .get(&text(p, "id")?)
+            .cloned()
+            .ok_or_else(|| crate::Error {
+                code: -32004,
+                message: "Record not found".into(),
+            })?;
+        if p["revision"].as_i64() != Some(row.revision) {
+            return Err(conflict());
+        }
+        if row.kind != "task" {
+            return Err(invalid("id must identify a Task"));
+        }
+        let mut targets = self.descendants(&row.id);
+        targets.push(row.clone());
+        if targets.iter().any(|target| {
+            matches!(target.kind.as_str(), "task" | "ticket" | "job") && !terminal(&target.body)
+                || target.active
+        }) {
+            return Err(rule(
+                "Complete or cancel the Task and all its work before deleting",
+            ));
+        }
+        let ids: BTreeSet<_> = targets.iter().map(|target| target.id.clone()).collect();
+        for other in self
+            .rows
+            .values()
+            .filter(|other| other.kind == "ticket" && !ids.contains(&other.id))
+        {
+            if strings(&other.body, "depends", false)?
+                .iter()
+                .any(|id| ids.contains(id))
+            {
+                return Err(rule(
+                    "Another Task has a Ticket that references this Task's Tickets",
+                ));
+            }
+        }
+        let project = self.project(&row)?;
+        let names: BTreeMap<_, _> = targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .body
+                    .get("objective")
+                    .cloned()
+                    .map(|name| (target.id.clone(), name))
+            })
+            .collect();
+        for mut target in targets {
+            let mut before = history_summary(view(&target));
+            if target.kind == "run" {
+                if let Some(name) = target.body["job"].as_str().and_then(|id| names.get(id)) {
+                    before["record"]["objective"] = name.clone();
+                }
+            }
+            target.revision += 1;
+            target.deleted = true;
+            target.active = false;
+            target.flags = json!({"physical":true});
+            target.body = before["record"].clone();
+            self.rows.remove(&target.id);
+            self.changes.push(Change {
+                row: target,
+                before: Some(before),
+                event: "record.deleted".into(),
+                project: project.clone(),
+            });
+        }
+        Ok(json!({"id":row.id,"deleted":true,"physical":true,"records":ids.len()}))
     }
     pub fn set_status(&mut self, p: &Value) -> Result<Value> {
         let mut row = self.expect(p)?;
@@ -987,6 +1082,7 @@ impl Engine {
     }
     pub fn apply(&mut self, method: &str, p: &Value) -> Result<Value> {
         match method {
+            "task.purge" => self.purge_task(p),
             "status.set" => self.set_status(p),
             "run.start" => self.start_run(p),
             "run.finish" => self.finish_run(p),
@@ -1024,6 +1120,7 @@ mod tests {
         };
         let engine = Engine {
             rows: BTreeMap::from([(deleted.id.clone(), deleted)]),
+            reserved_ids: BTreeSet::from(["job-20000000".into()]),
             changes: vec![],
             actor: vec!["operator".into()],
             reason: "Test ID reservation".into(),
@@ -1039,10 +1136,15 @@ mod tests {
                 candidate
             })
             .unwrap();
-        assert_eq!(attempts, 3);
-        assert_eq!(body["id"], "job-20000000");
-        assert!(reserved.contains("job-20000000"));
-        for id in ["job-00000000", "job-10000000", "job-20000000"] {
+        assert_eq!(attempts, 4);
+        assert_eq!(body["id"], "job-30000000");
+        assert!(reserved.contains("job-30000000"));
+        for id in [
+            "job-00000000",
+            "job-10000000",
+            "job-20000000",
+            "job-30000000",
+        ] {
             assert_eq!(
                 engine
                     .assign_id("job", &mut json!({"id":id}), &mut reserved)
