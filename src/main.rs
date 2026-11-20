@@ -15,7 +15,7 @@ Environment:
   TTJCORE_HOME selects the local Core profile for every command.
 serve owns the DB; call and rpc connect to the running Core without TCP.
 rpc bridges JSON-RPC requests, responses and ttj.changed notifications over stdio.
-Mutations need actor and reason. Use operation for retries and revision for updates.
+Mutations need actor; methods lists required fields. Use operation for retries and revision for updates.
 ";
 #[tokio::main]
 async fn main() {
