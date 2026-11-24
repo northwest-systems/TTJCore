@@ -31,9 +31,11 @@ ttjcore call project.list
 
 ## サンプルProjectをコマンドで操作する
 
-インストール後、新しいPowerShell 7のターミナルで以下を順に実行します。専用の一時profileとSQLiteを使い、サンプルProjectの作成・名前の変更・取得結果の確認・作業完了までを記録します。既存のprofileは変更しません。
+インストール後、PowerShell 7またはBashの例を選び、新しいターミナルで順に実行します。どちらも専用の一時profileとSQLiteを使い、サンプルProjectの作成・名前の変更・取得結果の確認・作業完了までを記録します。既存のprofileは変更しません。
 
-### 1. Coreを起動し、担当者と作業計画を登録する
+### PowerShell 7
+
+#### 1. Coreを起動し、担当者と作業計画を登録する
 
 このサンプルの管理主体は`sample-owner`です。Workerは作業担当者、Sessionはその実行単位として別々に登録します。作成結果の`result.value`には、発行されたIDとrevisionを含むrecordのwrapperが返ります。
 
@@ -80,7 +82,7 @@ $ticket = (ttjcore --home $sampleHome call ticket.create --params $request | Con
 $jobId = $ticket.record.jobs[0].id
 ```
 
-### 2. Runを開始し、Project名を変更して確認する
+#### 2. Runを開始し、Project名を変更して確認する
 
 参照操作の結果は`result`に直接返ります。更新や実行開始には、対象の最新revisionを渡します。RunのactorはTicketに固定したWorker/Sessionの組です。
 
@@ -116,7 +118,7 @@ $request = @{
 ttjcore --home $sampleHome call run.finish --params $request
 ```
 
-### 3. JobとTaskの達成を確定し、結果を確認する
+#### 3. JobとTaskの達成を確定し、結果を確認する
 
 Runの終了だけではJobは完了しません。ここでは管理主体が取得結果を根拠にJobを完了させます。唯一のJobが完了するとTicketも自動で`completed`になります。Taskは達成条件を確認して明示的に完了させます。
 
@@ -152,6 +154,106 @@ ttjcore --home $sampleHome stop
 ```
 
 最後の表示でTask・Ticket・Jobがいずれも`completed`になっていることを確認できます。`stop`はサンプルのCoreだけを停止し、記録は`$sampleHome`内のSQLiteに残ります。各methodの詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+
+### Bash
+
+JSONの生成と、返されたID・revisionの取得に`jq`を使います。`ttjcore`と`jq`がPATHから実行できる環境で、以下を順に実行します。
+
+#### 1. Coreを起動し、担当者と作業計画を登録する
+
+```bash
+set -euo pipefail
+sample_home=$(mktemp -d /tmp/ttj-sample.XXXXXXXX)
+unset TTJCORE_DATABASE_URL
+export TTJCORE_MANAGEMENT_ACTORS='["sample-owner"]'
+ttjcore --home "$sample_home" ensure
+
+worker_id=$(ttjcore --home "$sample_home" call worker.create --params \
+  '{"actor":["sample-owner"],"reason":"サンプルの担当者を登録する","record":{"name":"サンプル担当者"}}' \
+  | jq -er '.result.value.record.id')
+
+request=$(jq -cn --arg worker "$worker_id" \
+  '{actor:["sample-owner"],reason:"担当者のSessionを開始する",record:{worker_id:$worker}}')
+session_id=$(ttjcore --home "$sample_home" call session.create --params "$request" \
+  | jq -er '.result.value.record.id')
+
+project_id=$(ttjcore --home "$sample_home" call project.create --params \
+  '{"actor":["sample-owner"],"reason":"サンプルProjectを作成する","record":{"name":"CLIサンプル"}}' \
+  | jq -er '.result.value.record.id')
+
+request=$(jq -cn --arg project "$project_id" \
+  '{actor:["sample-owner"],reason:"Projectの操作を確認するTaskを作成する",parent:$project,
+    record:{objective:"Projectの名前を変更して確認する",criteria:["変更後の名前をコマンドで確認できる"]}}')
+task_id=$(ttjcore --home "$sample_home" call task.create --params "$request" \
+  | jq -er '.result.value.record.id')
+
+request=$(jq -cn --arg task "$task_id" --arg worker "$worker_id" --arg session "$session_id" \
+  '{actor:["sample-owner"],reason:"担当SessionとJobを確定する",
+    record:{task_id:$task,worker_id:$worker,session_id:$session,
+      objective:"Project名を更新して取得結果を確認する",
+      jobs:[{objective:"Project名の更新と確認",criteria:["project.getのnameがCLIサンプル（確認済み）である"]}]}}')
+ticket=$(ttjcore --home "$sample_home" call ticket.create --params "$request" | jq -ce '.result.value')
+job_id=$(jq -er '.record.jobs[0].id' <<< "$ticket")
+```
+
+#### 2. Runを開始し、Project名を変更して確認する
+
+```bash
+request=$(jq -cn --arg id "$job_id" '{id:$id}')
+job=$(ttjcore --home "$sample_home" call job.get --params "$request" | jq -ce '.result')
+request=$(jq -cn --arg worker "$worker_id" --arg session "$session_id" --arg job "$job_id" \
+  --argjson revision "$(jq -r '.revision' <<< "$job")" \
+  '{actor:[$worker,$session],reason:"名前の更新と確認を開始する",job:$job,revision:$revision}')
+run_id=$(ttjcore --home "$sample_home" call run.start --params "$request" | jq -er '.result.value.run.record.id')
+
+request=$(jq -cn --arg id "$project_id" '{id:$id}')
+project=$(ttjcore --home "$sample_home" call project.get --params "$request" | jq -ce '.result')
+request=$(jq -cn --arg id "$project_id" --argjson revision "$(jq -r '.revision' <<< "$project")" \
+  '{actor:["sample-owner"],reason:"サンプルProjectの名前を変更する",id:$id,revision:$revision,
+    patch:{name:"CLIサンプル（確認済み）"}}')
+ttjcore --home "$sample_home" call project.update --params "$request"
+
+request=$(jq -cn --arg id "$project_id" '{id:$id}')
+project=$(ttjcore --home "$sample_home" call project.get --params "$request" | jq -ce '.result')
+jq -e '.record.name == "CLIサンプル（確認済み）"' <<< "$project"
+jq '.record | {id,name}' <<< "$project"
+
+request=$(jq -cn --arg id "$run_id" '{id:$id}')
+run=$(ttjcore --home "$sample_home" call run.get --params "$request" | jq -ce '.result')
+request=$(jq -cn --arg worker "$worker_id" --arg session "$session_id" --arg id "$run_id" \
+  --argjson revision "$(jq -r '.revision' <<< "$run")" \
+  '{actor:[$worker,$session],reason:"変更後のProject名を確認した",id:$id,revision:$revision,result:"succeeded"}')
+ttjcore --home "$sample_home" call run.finish --params "$request"
+```
+
+#### 3. JobとTaskの達成を確定し、結果を確認する
+
+PowerShell版と同様に、Run終了後に管理主体がJob・Taskの達成を確定します。
+
+```bash
+request=$(jq -cn --arg id "$job_id" '{id:$id}')
+job=$(ttjcore --home "$sample_home" call job.get --params "$request" | jq -ce '.result')
+request=$(jq -cn --arg id "$job_id" --argjson revision "$(jq -r '.revision' <<< "$job")" \
+  '{mode:"management",actor:["sample-owner"],reason:"Jobの達成条件を確認した",id:$id,revision:$revision,
+    status:"completed",criteria_met:true,result:"project.getで変更後の名前がCLIサンプル（確認済み）であることを確認した"}')
+ttjcore --home "$sample_home" call status.set --params "$request"
+
+request=$(jq -cn --arg id "$task_id" '{id:$id}')
+task=$(ttjcore --home "$sample_home" call task.get --params "$request" | jq -ce '.result')
+request=$(jq -cn --arg id "$task_id" --argjson revision "$(jq -r '.revision' <<< "$task")" \
+  '{mode:"management",actor:["sample-owner"],reason:"Taskの達成条件を確認した",id:$id,revision:$revision,
+    status:"completed",criteria_met:true,result:"Projectの名前変更とコマンドでの確認が完了した"}')
+ttjcore --home "$sample_home" call status.set --params "$request"
+
+request=$(jq -cn --arg id "$project_id" '{id:$id}')
+snapshot=$(ttjcore --home "$sample_home" call project.snapshot --params "$request" | jq -ce '.result')
+jq -r '.tasks[0] | [.task.record,.tickets[0].ticket.record,.tickets[0].jobs[0].record][]
+  | [.id,.status] | @tsv' <<< "$snapshot"
+
+ttjcore --home "$sample_home" stop
+```
+
+Task・Ticket・Jobの3行がいずれも`completed`になります。記録は`$sample_home`内のSQLiteに残ります。
 
 ## フォルダ構造
 
