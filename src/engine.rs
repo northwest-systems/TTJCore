@@ -1,7 +1,7 @@
+use crate::document::{self, Document};
 use crate::{Result, conflict, entity::record, invalid, rule};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub fn text(v: &Value, key: &str) -> Result<String> {
     v.get(key)
@@ -47,15 +47,7 @@ pub fn view(row: &record::Model) -> Value {
 }
 pub fn history_summary(value: Value) -> Value {
     let mut body = serde_json::Map::new();
-    for key in [
-        "id",
-        "name",
-        "objective",
-        "status",
-        "job",
-        "started",
-        "ended",
-    ] {
+    for key in ["id", "name", "objective", "status", "started", "ended"] {
         if let Some(field) = value["record"].get(key) {
             body.insert(key.into(), field.clone());
         }
@@ -102,6 +94,9 @@ impl Engine {
         Ok(row)
     }
     pub fn project(&self, row: &record::Model) -> Result<String> {
+        if matches!(row.kind.as_str(), "worker" | "session") {
+            return Ok(String::new());
+        }
         let mut current = row.clone();
         for _ in 0..6 {
             if current.kind == "project" {
@@ -118,17 +113,16 @@ impl Engine {
     }
     fn save(&mut self, mut row: record::Model, event: &str) -> Result<()> {
         let before = self.rows.get(&row.id).map(view);
-        if let Some(previous) = self.rows.get(&row.id) {
-            if previous.kind == row.kind
-                && previous.parent == row.parent
-                && previous.body == row.body
-                && previous.started == row.started
-                && previous.deleted == row.deleted
-                && previous.active == row.active
-                && previous.flags == row.flags
-            {
-                return Ok(());
-            }
+        if let Some(previous) = self.rows.get(&row.id)
+            && previous.kind == row.kind
+            && previous.parent == row.parent
+            && previous.body == row.body
+            && previous.started == row.started
+            && previous.deleted == row.deleted
+            && previous.active == row.active
+            && previous.flags == row.flags
+        {
+            return Ok(());
         }
         let event = if event == "status.changed"
             && before
@@ -195,48 +189,32 @@ impl Engine {
         Ok(())
     }
     fn validate(kind: &str, body: &Value) -> Result<()> {
-        text(body, "id")?;
-        match kind {
-            "project" => {
-                text(body, "name")?;
-            }
-            "task" | "job" => {
-                text(body, "objective")?;
-                strings(body, "criteria", true)?;
-            }
-            "ticket" => {
-                text(body, "objective")?;
-                strings(body, "jobs", true)?;
-            }
-            "knowledge" => {
-                text(body, "content")?;
-                text(body, "basis")?;
-            }
-            _ => {}
-        }
-        for field in ["assignee", "depends", "handoffs"] {
-            if body.get(field).is_some() {
-                strings(body, field, false)?;
+        document::check_record(kind, body)
+    }
+    pub fn record_body(&self, row: &record::Model) -> Value {
+        let mut body = row.body.clone();
+        let collections: &[(&str, &str)] = match row.kind.as_str() {
+            "project" => &[("knowledge", "knowledge"), ("tasks", "task")],
+            "ticket" => &[("jobs", "job")],
+            "job" => &[("runs", "run")],
+            _ => &[],
+        };
+        for (field, kind) in collections {
+            let mut children = self.children(&row.id);
+            children.retain(|r| r.kind == *kind && (!r.deleted || row.deleted));
+            children.sort_by_key(|r| r.flags["order"].as_u64().unwrap_or(0));
+            let items: Vec<_> = children.iter().map(|r| self.record_body(r)).collect();
+            if !items.is_empty() {
+                body[*field] = json!(items);
             }
         }
-        if let Some(deadline) = body.get("deadline") {
-            let date = deadline
-                .as_str()
-                .ok_or_else(|| invalid("deadline must be a datetime"))?;
-            OffsetDateTime::parse(date, &Rfc3339)
-                .map_err(|_| invalid("deadline needs a valid timezone-qualified datetime"))?;
-        }
-        if let Some(resume) = body.get("resume") {
-            if !resume.is_string() {
-                return Err(invalid("resume must be a string"));
-            }
-        }
-        if let Some(priority) = body.get("priority") {
-            if !priority.is_i64() {
-                return Err(invalid("priority must be an integer"));
-            }
-        }
-        Ok(())
+        omit_empty_arrays(&mut body);
+        body
+    }
+    pub fn record_view(&self, row: &record::Model) -> Value {
+        let mut value = view(row);
+        value["record"] = self.record_body(row);
+        value
     }
     fn children(&self, id: &str) -> Vec<record::Model> {
         self.rows
@@ -257,10 +235,10 @@ impl Engine {
         result
     }
     fn jobs(&self, ticket: &record::Model) -> Result<Vec<record::Model>> {
-        strings(&ticket.body, "jobs", true)?
-            .iter()
-            .map(|id| self.raw(id))
-            .collect()
+        let mut jobs = self.children(&ticket.id);
+        jobs.retain(|r| r.kind == "job");
+        jobs.sort_by_key(|r| r.flags["order"].as_u64().unwrap_or(0));
+        Ok(jobs)
     }
     fn current(&self, ticket: &record::Model) -> Result<Option<record::Model>> {
         Ok(self.jobs(ticket)?.into_iter().find(|r| !terminal(&r.body)))
@@ -268,7 +246,7 @@ impl Engine {
     fn dependencies(&self, ticket: &record::Model) -> Result<(bool, bool)> {
         let mut ready = true;
         let mut blocked = false;
-        for id in strings(&ticket.body, "depends", false)? {
+        for id in self.edges(ticket)? {
             let dependency = self.raw(&id)?;
             if dependency.kind != "ticket" {
                 return Err(rule("depends must reference Tickets"));
@@ -278,10 +256,33 @@ impl Engine {
         }
         Ok((ready, blocked))
     }
+    fn edges(&self, ticket: &record::Model) -> Result<Vec<String>> {
+        if terminal(&ticket.body) {
+            return Ok(vec![]);
+        }
+        let mut edges = strings(&ticket.body, "depends", false)?;
+        for job in self.jobs(ticket)?.iter().filter(|j| !terminal(&j.body)) {
+            for run in self.children(&job.id) {
+                let wait = &run.body["wait"];
+                if wait["resolved"].is_null()
+                    && let Some(target) = wait["target"]
+                        .as_str()
+                        .filter(|id| document::is_id_of("ticket", id))
+                {
+                    edges.push(target.to_owned());
+                }
+            }
+        }
+        Ok(edges)
+    }
     fn check_cycles(&self) -> Result<()> {
-        for ticket in self.rows.values().filter(|r| r.kind == "ticket") {
+        for ticket in self
+            .rows
+            .values()
+            .filter(|r| r.kind == "ticket" && !r.deleted)
+        {
             let mut seen = BTreeSet::new();
-            let mut queue = strings(&ticket.body, "depends", false)?;
+            let mut queue = self.edges(ticket)?;
             while let Some(id) = queue.pop() {
                 if id == ticket.id {
                     return Err(rule("Ticket dependencies must be acyclic"));
@@ -291,9 +292,9 @@ impl Engine {
                 }
                 let row = self.raw(&id)?;
                 if row.kind != "ticket" {
-                    return Err(rule("depends must reference Tickets"));
+                    return Err(rule("depends/wait.target must reference Tickets"));
                 }
-                queue.extend(strings(&row.body, "depends", false)?);
+                queue.extend(self.edges(&row)?);
             }
         }
         Ok(())
@@ -317,32 +318,56 @@ impl Engine {
             return Err(invalid("record must be an object"));
         }
         if body.get("id").is_none() {
-            let prefix = match kind {
-                "project" => "pj-",
-                "task" => "tsk-",
-                "ticket" => "tkt-",
-                "job" => "job-",
-                _ => "",
-            };
-            loop {
-                let mut random = random();
-                let mut id = prefix.to_owned();
-                for _ in 0..8 {
-                    id.push(
-                        b"0123456789abcdefghijklmnopqrstuvwxyz"[(random % 36) as usize] as char,
-                    );
-                    random /= 36;
-                }
-                if !self.rows.contains_key(&id)
-                    && !self.reserved_ids.contains(&id)
-                    && !reserved.contains(&id)
-                {
-                    body["id"] = json!(id);
-                    break;
+            let prefix = document::prefix(kind);
+            if let Some(prefix) = prefix {
+                let all: Vec<_> = self
+                    .rows
+                    .keys()
+                    .chain(self.reserved_ids.iter())
+                    .chain(reserved.iter())
+                    .filter(|id| document::is_id_of(kind, id))
+                    .collect();
+                let head = all
+                    .first()
+                    .map(|id| id.rsplit_once('-').unwrap().0.to_owned())
+                    .unwrap_or_else(|| {
+                        let mut number = random();
+                        let mut series = String::new();
+                        for _ in 0..8 {
+                            series.push(
+                                b"0123456789abcdefghijklmnopqrstuvwxyz"[(number % 36) as usize]
+                                    as char,
+                            );
+                            number /= 36;
+                        }
+                        format!("{prefix}-{series}")
+                    });
+                let previous = all
+                    .iter()
+                    .filter_map(|id| id.rsplit_once('-'))
+                    .filter(|(series, _)| *series == head)
+                    .map(|(_, n)| n)
+                    .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+                    .unwrap_or("0");
+                let number = increment(previous);
+                body["id"] = json!(format!("{head}-{number}"));
+            } else {
+                loop {
+                    let id = format!("{:032x}", random());
+                    if !self.rows.contains_key(&id)
+                        && !self.reserved_ids.contains(&id)
+                        && !reserved.contains(&id)
+                    {
+                        body["id"] = json!(id);
+                        break;
+                    }
                 }
             }
         }
         let id = text(body, "id")?;
+        if document::prefix(kind).is_some() && !document::is_id_of(kind, &id) {
+            return Err(invalid("Invalid TTJ 1.1.0 ID for record kind"));
+        }
         if self.rows.contains_key(&id) || self.reserved_ids.contains(&id) || !reserved.insert(id) {
             return Err(conflict());
         }
@@ -366,12 +391,12 @@ impl Engine {
             .cloned()
             .ok_or_else(|| invalid("record is required"))?;
         let mut reserved = BTreeSet::new();
-        if kind == "ticket" {
-            if let Some(jobs) = body.get("jobs").and_then(Value::as_array) {
-                for job in jobs {
-                    if job.get("id").is_some() && !reserved.insert(text(job, "id")?) {
-                        return Err(conflict());
-                    }
+        if kind == "ticket"
+            && let Some(jobs) = body.get("jobs").and_then(Value::as_array)
+        {
+            for job in jobs.iter().filter(|job| job.get("id").is_some()) {
+                if !reserved.insert(text(job, "id")?) {
+                    return Err(conflict());
                 }
             }
         }
@@ -380,18 +405,59 @@ impl Engine {
         let mut jobs = vec![];
         let mut job_displays = vec![];
         let parent = match kind {
+            "worker" => {
+                Self::allowed(&body, &["id", "name"])?;
+                None
+            }
+            "session" => {
+                Self::allowed(&body, &["id", "worker_id", "started", "ended"])?;
+                if self.get(&text(&body, "worker_id")?)?.kind != "worker" {
+                    return Err(rule("Session needs a Worker"));
+                }
+                None
+            }
             "project" => {
                 Self::allowed(&body, &["id", "name"])?;
                 None
             }
-            "task" => {
-                Self::allowed(
-                    &body,
-                    &["id", "project", "objective", "criteria", "deadline"],
-                )?;
-                let parent = self.get(&text(&body, "project")?)?;
+            "task" | "knowledge" => {
+                let parent = self.get(&text(p, "parent")?)?;
                 if parent.kind != "project" {
-                    return Err(rule("Task needs a Project"));
+                    return Err(rule("Task/Knowledge needs a Project parent"));
+                }
+                if kind == "task" {
+                    Self::allowed(
+                        &body,
+                        &[
+                            "id",
+                            "objective",
+                            "criteria",
+                            "deadline",
+                            "resume",
+                            "handoff",
+                            "status",
+                        ],
+                    )?;
+                    initial_status(&mut body)?;
+                } else {
+                    Self::allowed(&body, &["id", "content", "basis", "supersedes"])?;
+                    if let Some(id) = body.get("supersedes") {
+                        let mut old = self.get(
+                            id.as_str()
+                                .ok_or_else(|| invalid("supersedes must be an id"))?,
+                        )?;
+                        if old.kind != "knowledge"
+                            || old.parent != Some(parent.id.clone())
+                            || old.body["status"] != "active"
+                        {
+                            return Err(rule(
+                                "supersedes must reference active Knowledge in the same Project",
+                            ));
+                        }
+                        old.body["status"] = json!("supersed");
+                        self.save(old, "knowledge.superseded")?;
+                    }
+                    body["status"] = json!("active");
                 }
                 Some(parent.id)
             }
@@ -400,28 +466,31 @@ impl Engine {
                     &body,
                     &[
                         "id",
-                        "task",
+                        "task_id",
+                        "worker_id",
+                        "session_id",
                         "objective",
+                        "exclusions",
                         "jobs",
-                        "assignee",
                         "depends",
-                        "handoffs",
+                        "refs",
+                        "artifacts",
                         "resume",
-                        "priority",
+                        "status",
                     ],
                 )?;
-                let parent = self.get(&text(&body, "task")?)?;
+                let parent = self.get(&text(&body, "task_id")?)?;
                 if parent.kind != "task" || terminal(&parent.body) {
                     return Err(rule("Ticket needs a non-terminal Task"));
                 }
-                jobs = body["jobs"]
-                    .as_array()
-                    .filter(|a| !a.is_empty())
-                    .cloned()
-                    .ok_or_else(|| {
-                        invalid("jobs must contain one or more complete Job definitions")
-                    })?;
-                let mut ids = vec![];
+                self.check_session(&body)?;
+                jobs = match body.get("jobs") {
+                    None => vec![],
+                    Some(value) => value
+                        .as_array()
+                        .cloned()
+                        .ok_or_else(|| invalid("jobs must be an array of Job objects"))?,
+                };
                 for job in &mut jobs {
                     if job.get("id").is_some() {
                         reserved.remove(&text(job, "id")?);
@@ -431,64 +500,54 @@ impl Engine {
                     job_displays.push(Self::display(display.as_ref())?);
                     Self::allowed(
                         job,
-                        &["id", "objective", "criteria", "instructions", "assignee"],
+                        &["id", "objective", "criteria", "instructions", "status"],
                     )?;
+                    initial_status(job)?;
                     Self::validate("job", job)?;
-                    let id = text(job, "id")?;
-                    if let Some(instructions) = job.get("instructions") {
-                        if !instructions.is_string() {
-                            return Err(invalid("instructions must be a string"));
-                        }
-                    }
-                    ids.push(id);
                 }
-                body["jobs"] = json!(ids);
+                body["jobs"] = json!(jobs);
+                initial_status(&mut body)?;
                 Some(parent.id)
             }
-            "knowledge" => {
-                Self::allowed(&body, &["id", "project", "content", "basis", "supersedes"])?;
-                let parent = self.get(&text(&body, "project")?)?;
-                if parent.kind != "project" {
-                    return Err(rule("Knowledge needs a Project"));
-                }
-                if let Some(id) = body.get("supersedes") {
-                    let mut old = self.get(
-                        id.as_str()
-                            .ok_or_else(|| invalid("supersedes must be an id"))?,
-                    )?;
-                    if old.kind != "knowledge"
-                        || old.parent != Some(parent.id.clone())
-                        || old.body["status"] != "active"
-                    {
-                        return Err(rule(
-                            "supersedes must reference active Knowledge in the same Project",
-                        ));
-                    }
-                    old.body["status"] = json!("supersed");
-                    self.save(old, "knowledge.superseded")?;
-                }
-                body.as_object_mut().unwrap().remove("project");
-                body["status"] = json!("active");
-                Some(parent.id)
-            }
-            _ => {
-                return Err(rule(
-                    "Jobs are created atomically inside ticket.create; Runs use run.start",
-                ));
-            }
+            _ => return Err(rule("Jobs use ticket.create; Runs use run.start")),
         };
-        if matches!(kind, "task" | "ticket") {
-            body["status"] = json!("todo");
-        }
         Self::validate(kind, &body)?;
+        if kind == "ticket" {
+            body.as_object_mut().unwrap().remove("jobs");
+        }
         let id = self.insert(kind, parent, body, display)?;
-        for (mut job, display) in jobs.into_iter().zip(job_displays) {
-            job["status"] = json!("todo");
-            self.insert("job", Some(id.clone()), job, display)?;
+        for (order, (job, display)) in jobs.into_iter().zip(job_displays).enumerate() {
+            let job_id = self.insert("job", Some(id.clone()), job, display)?;
+            let mut row = self.get(&job_id)?;
+            row.flags["order"] = json!(order);
+            self.save(row, "record.updated")?;
         }
         self.check_cycles()?;
         self.reconcile()?;
-        Ok(view(&self.get(&id)?))
+        Ok(self.record_view(&self.get(&id)?))
+    }
+    fn check_session(&self, body: &Value) -> Result<()> {
+        let worker = self.get(&text(body, "worker_id")?)?;
+        let session = self.get(&text(body, "session_id")?)?;
+        if worker.kind != "worker"
+            || session.kind != "session"
+            || session.body["worker_id"] != worker.id
+        {
+            return Err(rule("Ticket requires a Session belonging to its Worker"));
+        }
+        Ok(())
+    }
+    fn authorize(&self, ticket: &record::Model) -> Result<()> {
+        let expected = vec![
+            text(&ticket.body, "worker_id")?,
+            text(&ticket.body, "session_id")?,
+        ];
+        if self.actor != expected {
+            return Err(rule(
+                "Execution requires the Ticket's worker_id and session_id as actor",
+            ));
+        }
+        self.check_session(&ticket.body)
     }
     pub fn update(&mut self, kind: &str, p: &Value) -> Result<Value> {
         let mut row = self.expect(p)?;
@@ -498,9 +557,11 @@ impl Engine {
         let patch = p.get("patch").ok_or_else(|| invalid("patch is required"))?;
         let allowed: &[&str] = match kind {
             "project" => &["name"],
-            "task" => &["objective", "criteria", "deadline"],
-            "ticket" => &["assignee", "depends", "handoffs", "resume", "priority"],
-            "job" => &["assignee", "resume"],
+            "task" => &["objective", "criteria", "deadline", "resume", "handoff"],
+            "ticket" => &["depends", "refs", "artifacts", "resume"],
+            "job" => &["result", "artifacts", "resume"],
+            "worker" => &["name"],
+            "session" => &["ended"],
             "knowledge" => &["status"],
             _ => return Err(rule("Runs are updated through run.finish")),
         };
@@ -526,9 +587,16 @@ impl Engine {
                 row.flags["display"][key] = value.clone();
             }
         }
-        let previous_assignee = row.body.get("assignee").cloned();
+        if let Some(run) = p.get("run") {
+            self.authorize_run(run, &row)?;
+        }
         for (key, value) in patch.as_object().unwrap() {
-            if value.is_null() && matches!(key.as_str(), "deadline" | "resume" | "assignee") {
+            if value.is_null()
+                && matches!(
+                    key.as_str(),
+                    "deadline" | "resume" | "handoff" | "ended" | "result"
+                )
+            {
                 row.body.as_object_mut().unwrap().remove(key);
             } else {
                 row.body[key] = value.clone();
@@ -536,46 +604,15 @@ impl Engine {
         }
         Self::validate(kind, &row.body)?;
         let id = row.id.clone();
-        let assignment_changed = previous_assignee != row.body.get("assignee").cloned();
         self.save(row, "record.updated")?;
-        if assignment_changed {
-            let runs: Vec<_> = self
-                .rows
-                .values()
-                .filter(|run| run.kind == "run" && run.active)
-                .cloned()
-                .collect();
-            for run in runs {
-                let job = self.raw(run.parent.as_deref().unwrap_or(""))?;
-                let inherited = job.body.get("assignee").is_none();
-                let affected = job.id == id
-                    || (kind == "ticket"
-                        && inherited
-                        && job.parent.as_deref() == Some(id.as_str()));
-                if !affected {
-                    continue;
-                }
-                let assigned = if inherited {
-                    strings(&self.parent(&job)?.body, "assignee", false)?
-                } else {
-                    strings(&job.body, "assignee", false)?
-                };
-                if !assigned.is_empty()
-                    && strings(&run.body, "actor", true)?
-                        .iter()
-                        .any(|a| !assigned.contains(a))
-                {
-                    self.revoke(run)?;
-                }
-            }
-        }
         self.check_cycles()?;
         self.reconcile()?;
-        Ok(view(&self.get(&id)?))
+        Ok(self.record_view(&self.get(&id)?))
     }
     fn revoke(&mut self, mut run: record::Model) -> Result<()> {
         run.active = false;
-        run.flags["revoked"] = json!(true);
+        run.flags["stop_requested"] = json!(true);
+        run.body["result"] = json!("canceled");
         self.save(run, "execution.stop_requested")
     }
     pub fn delete(&mut self, kind: &str, p: &Value) -> Result<Value> {
@@ -601,6 +638,13 @@ impl Engine {
         }
         if kind == "knowledge" && row.body["status"] == "active" {
             return Err(rule("Supersede Knowledge before deleting it"));
+        }
+        if matches!(kind, "worker" | "session")
+            && self.rows.values().any(|other| {
+                other.body["worker_id"] == row.id || other.body["session_id"] == row.id
+            })
+        {
+            return Err(rule("Worker/Session is still referenced"));
         }
         for mut target in targets {
             if target.deleted {
@@ -645,6 +689,15 @@ impl Engine {
             if strings(&other.body, "depends", false)?
                 .iter()
                 .any(|id| ids.contains(id))
+                || other.body["refs"].as_array().is_some_and(|refs| {
+                    refs.iter()
+                        .any(|r| r["ticket_id"].as_str().is_some_and(|id| ids.contains(id)))
+                })
+                || self.descendants(&other.id).iter().any(|r| {
+                    r.body["wait"]["target"]
+                        .as_str()
+                        .is_some_and(|id| ids.contains(id))
+                })
             {
                 return Err(rule(
                     "Another Task has a Ticket that references this Task's Tickets",
@@ -664,10 +717,10 @@ impl Engine {
             .collect();
         for mut target in targets {
             let mut before = history_summary(view(&target));
-            if target.kind == "run" {
-                if let Some(name) = target.body["job"].as_str().and_then(|id| names.get(id)) {
-                    before["record"]["objective"] = name.clone();
-                }
+            if target.kind == "run"
+                && let Some(name) = target.parent.as_ref().and_then(|id| names.get(id))
+            {
+                before["record"]["objective"] = name.clone();
             }
             target.revision += 1;
             target.deleted = true;
@@ -689,10 +742,13 @@ impl Engine {
         if !matches!(row.kind.as_str(), "task" | "ticket" | "job") {
             return Err(rule("This record has no work status"));
         }
+        if let Some(run) = p.get("run") {
+            self.authorize_run(run, &row)?;
+        }
         let target = text(p, "status")?;
         let source = text(&row.body, "status")?;
         if source == target {
-            return Ok(view(&row));
+            return Ok(self.record_view(&row));
         }
         if terminal(&row.body) {
             return Err(rule("Terminal records cannot be reopened"));
@@ -761,21 +817,7 @@ impl Engine {
             }
             "blocked" => {
                 row.flags["blocked"] = json!(true);
-                let mut ticket = if row.kind == "job" {
-                    self.parent(&row)?
-                } else {
-                    row.clone()
-                };
-                if ticket.kind == "ticket" {
-                    let mut notes = strings(&ticket.body, "handoffs", false)?;
-                    notes.push(format!("課題：{}", self.reason));
-                    ticket.body["handoffs"] = json!(notes);
-                    if ticket.id == row.id {
-                        row.body["handoffs"] = ticket.body["handoffs"].clone();
-                    } else {
-                        self.save(ticket, "record.updated")?;
-                    }
-                }
+                row.body["resume"] = json!(self.reason);
             }
             "completed" => {
                 if row.kind == "ticket" {
@@ -788,7 +830,12 @@ impl Engine {
                             "Completion requires criteria_met=true and result evidence",
                         ));
                     }
-                    row.body["result"] = json!(text(p, "result")?);
+                    let result = text(p, "result")?;
+                    if row.kind == "job" {
+                        row.body["result"] = json!(result);
+                    } else {
+                        row.flags["completion_evidence"] = json!(result);
+                    }
                     if row.flags["waiting"] == true || row.flags["blocked"] == true {
                         return Err(rule("Resolve constraints before completing"));
                     }
@@ -810,6 +857,7 @@ impl Engine {
                             .into_iter()
                             .filter(|r| r.kind == "ticket")
                             .collect();
+                        row.body.as_object_mut().unwrap().remove("handoff");
                         if tickets.is_empty() || tickets.iter().any(|t| !terminal(&t.body)) {
                             return Err(rule("Task requires at least one Ticket, all terminal"));
                         }
@@ -838,36 +886,26 @@ impl Engine {
                         && !terminal(&child.body)
                     {
                         child.body["status"] = json!("canceled");
+                        if child.kind == "ticket" {
+                            child.body["cancel_reason"] = json!(self.reason);
+                        }
                         self.save(child, "status.changed")?;
                     }
                 }
             }
             _ => return Err(invalid("Unknown status")),
         }
-        if let Some(run_id) = p.get("run") {
-            let run = self.get(
-                run_id
-                    .as_str()
-                    .ok_or_else(|| invalid("run must be an id"))?,
-            )?;
-            if run.kind != "run"
-                || !run.active
-                || run.parent.as_deref() != Some(row.id.as_str())
-                || run.flags["revoked"] == true
-                || run.body["generation"] != row.flags["generation"]
-            {
-                return Err(rule("Run authority has expired"));
-            }
-            let participants = strings(&run.body, "actor", true)?;
-            if self.actor.iter().any(|actor| !participants.contains(actor)) {
-                return Err(rule("Only Run participants may change Job status"));
-            }
+        if target == "canceled" && row.kind == "job" && p.get("result").is_some() {
+            row.body["result"] = json!(text(p, "result")?);
+        }
+        if target == "canceled" && row.kind == "ticket" {
+            row.body["cancel_reason"] = json!(text(p, "cancel_reason")?);
         }
         row.body["status"] = json!(target);
         let id = row.id.clone();
         self.save(row, "status.changed")?;
         self.reconcile()?;
-        Ok(view(&self.get(&id)?))
+        Ok(self.record_view(&self.get(&id)?))
     }
     fn ordered(&self, job: &record::Model) -> Result<()> {
         let ticket = self.parent(job)?;
@@ -919,63 +957,33 @@ impl Engine {
         {
             return Err(rule("Job and Ticket must be todo or doing"));
         }
-        let assigned = if job.body.get("assignee").is_some() {
-            strings(&job.body, "assignee", false)?
-        } else {
-            strings(&ticket.body, "assignee", false)?
-        };
-        if !assigned.is_empty() && self.actor.iter().any(|a| !assigned.contains(a)) {
-            return Err(rule("Actor is not assigned to this Job"));
-        }
-        if let Some(previous) = p.get("retry_of") {
-            let old = self.get(
-                previous
-                    .as_str()
-                    .ok_or_else(|| invalid("retry_of must be an id"))?,
-            )?;
-            if old.kind != "run" || old.parent.as_deref() != Some(job.id.as_str()) {
-                return Err(rule("Retry must reference this Job's Run"));
-            }
-            text(p, "safety")?;
-            self.revoke(old)?;
-        }
-        let runs = self.children(&job.id);
-        let active: Vec<_> = runs
-            .iter()
-            .filter(|r| r.kind == "run" && r.active)
-            .collect();
-        if active.iter().any(|r| {
-            strings(&r.body, "actor", true)
-                .unwrap_or_default()
-                .iter()
-                .any(|a| self.actor.contains(a))
-        }) {
-            return Err(rule(
-                "Actor already has an active Run; use the same operation or an explicit safe retry",
-            ));
-        }
-        let prior_jobs: Vec<_> = self
+        self.authorize(&ticket)?;
+        if self
             .jobs(&ticket)?
-            .into_iter()
-            .take_while(|j| j.id != job.id)
-            .collect();
-        let unsafe_previous = runs
             .iter()
-            .any(|r| !r.active && r.body.get("ended").is_none())
-            || prior_jobs
-                .iter()
-                .flat_map(|j| self.children(&j.id))
-                .any(|r| r.kind == "run" && r.body.get("ended").is_none());
-        if unsafe_previous {
+            .flat_map(|j| self.children(&j.id))
+            .any(|r| r.kind == "run" && r.active)
+        {
+            return Err(rule("A Ticket may have at most one open Run"));
+        }
+        if p.get("retry_of").is_some() {
+            let previous = self.get(&text(p, "retry_of")?)?;
+            if previous.kind != "run"
+                || previous.parent.as_deref() != Some(job.id.as_str())
+                || previous.active
+            {
+                return Err(rule("Retry requires a closed Run of this Job"));
+            }
+        }
+        let previous: Vec<_> = self
+            .jobs(&ticket)?
+            .iter()
+            .flat_map(|j| self.children(&j.id))
+            .collect();
+        if previous.iter().any(|r| r.kind == "run") {
             text(p, "safety")?;
         }
-        let generation = if active.is_empty() {
-            job.flags["generation"].as_i64().unwrap_or(0) + 1
-        } else {
-            job.flags["generation"].as_i64().unwrap_or(1)
-        };
         job.started = true;
-        job.flags["generation"] = json!(generation);
         job.body["status"] = json!("doing");
         self.save(job.clone(), "status.changed")?;
         ticket.started = true;
@@ -994,32 +1002,68 @@ impl Engine {
             run_id["id"] = id.clone();
         }
         self.assign_id("run", &mut run_id, &mut BTreeSet::new())?;
-        let body = json!({"id":run_id["id"],"job":job.id,"actor":self.actor,"started":self.now,"generation":generation});
+        let body = json!({"id":run_id["id"],"started":self.now});
         let id = self.insert("run", Some(job.id.clone()), body, json!({}))?;
         let mut run = self.get(&id)?;
         run.active = true;
+        run.flags["order"] = json!(self.children(&job.id).len());
         self.save(run, "run.started")?;
-        Ok(json!({"run":view(&self.get(&id)?),"job":view(&self.get(&job.id)?)}))
+        Ok(
+            json!({"run":self.record_view(&self.get(&id)?),"job":self.record_view(&self.get(&job.id)?)}),
+        )
     }
     pub fn finish_run(&mut self, p: &Value) -> Result<Value> {
         let mut run = self.expect(p)?;
-        if run.kind != "run" || !run.active || run.flags["revoked"] == true {
-            return Err(rule("Run authority has expired"));
-        }
-        let job = self.parent(&run)?;
-        if terminal(&job.body) || run.body["generation"] != job.flags["generation"] {
-            return Err(rule("Run generation has expired"));
-        }
-        let participants = strings(&run.body, "actor", true)?;
-        if self.actor.iter().any(|a| !participants.contains(a)) {
-            return Err(rule("Only Run participants may finish it"));
-        }
+        self.authorize_run(&json!(run.id), &run)?;
         run.body["result"] = json!(text(p, "result")?);
         run.body["ended"] = json!(self.now);
         run.active = false;
         let id = run.id.clone();
         self.save(run, "run.finished")?;
-        Ok(view(&self.get(&id)?))
+        Ok(self.record_view(&self.get(&id)?))
+    }
+    fn authorize_run(&self, value: &Value, target: &record::Model) -> Result<()> {
+        let run = self.get(value.as_str().ok_or_else(|| invalid("run must be an ID"))?)?;
+        if run.kind != "run" || !run.active || run.body.get("result").is_some() {
+            return Err(rule("Run authority has expired"));
+        }
+        let job = self.parent(&run)?;
+        let ticket = self.parent(&job)?;
+        let task = self.parent(&ticket)?;
+        if ![
+            run.id.as_str(),
+            job.id.as_str(),
+            ticket.id.as_str(),
+            task.id.as_str(),
+        ]
+        .contains(&target.id.as_str())
+        {
+            return Err(rule("Run does not belong to target"));
+        }
+        if terminal(&job.body) || terminal(&ticket.body) {
+            return Err(rule("Run authority has expired"));
+        }
+        self.authorize(&ticket)
+    }
+    pub fn wait_run(&mut self, p: &Value) -> Result<Value> {
+        let mut run = self.expect(p)?;
+        self.authorize_run(&json!(run.id), &run)?;
+        let patch = p
+            .get("wait")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("wait must be a single object"))?;
+        if !run.body["wait"].is_object() {
+            run.body["wait"] = json!({});
+        }
+        for (key, value) in patch {
+            run.body["wait"][key] = value.clone();
+        }
+        Self::validate("run", &run.body)?;
+        let id = run.id.clone();
+        self.save(run, "run.wait_changed")?;
+        self.check_cycles()?;
+        self.reconcile()?;
+        Ok(self.record_view(&self.get(&id)?))
     }
     fn reconcile(&mut self) -> Result<()> {
         let ids: Vec<_> = self
@@ -1032,12 +1076,12 @@ impl Engine {
             let mut changed = false;
             for id in &ids {
                 let mut row = self.get(id)?;
-                if row.body["status"] == "canceled" {
+                if terminal(&row.body) {
                     continue;
                 }
                 let (ready, blocked) = self.dependencies(&row)?;
                 let current = self.current(&row)?;
-                let status = if current.is_none() {
+                let status = if current.is_none() && !self.jobs(&row)?.is_empty() {
                     "completed"
                 } else if row.body["status"] == "paused" {
                     "paused"
@@ -1048,12 +1092,10 @@ impl Engine {
                         .is_some_and(|j| j.body["status"] == "blocked")
                 {
                     "blocked"
-                } else if current
-                    .as_ref()
-                    .is_some_and(|j| j.body["status"] == "paused")
-                {
-                    "waiting"
                 } else if row.flags["waiting"] == true
+                    || current
+                        .as_ref()
+                        .is_some_and(|j| j.body["status"] == "paused")
                     || !ready
                     || current
                         .as_ref()
@@ -1080,12 +1122,235 @@ impl Engine {
         }
         Err(rule("Unable to reconcile dependency states"))
     }
+    pub fn export(&self, p: &Value) -> Result<Document> {
+        let mut value = json!({"protocol": crate::PROTOCOL});
+        let project = p.get("project").map(|_| text(p, "project")).transpose()?;
+        if let Some(id) = &project {
+            let row = self.get(id)?;
+            if row.kind != "project" {
+                return Err(invalid("project must identify a Project"));
+            }
+            value["project"] = self.record_body(&row);
+        }
+        let tickets = strings(p, "tickets", false)?;
+        let mut bodies = vec![];
+        let mut workers = BTreeSet::new();
+        let mut sessions = BTreeSet::new();
+        for row in self
+            .rows
+            .values()
+            .filter(|r| r.kind == "ticket" && !r.deleted)
+        {
+            if project
+                .as_ref()
+                .is_some_and(|id| self.project(row).ok().as_ref() != Some(id))
+            {
+                continue;
+            }
+            if !tickets.is_empty() && !tickets.contains(&row.id) {
+                continue;
+            }
+            workers.insert(text(&row.body, "worker_id")?);
+            sessions.insert(text(&row.body, "session_id")?);
+            bodies.push(self.record_body(row));
+        }
+        for id in &tickets {
+            if self.get(id)?.kind != "ticket" {
+                return Err(invalid("tickets must identify Tickets"));
+            }
+        }
+        value["tickets"] = json!(bodies);
+        if tickets.is_empty() {
+            for row in self.rows.values().filter(|r| !r.deleted) {
+                if row.kind == "worker" {
+                    workers.insert(row.id.clone());
+                }
+                if row.kind == "session" {
+                    sessions.insert(row.id.clone());
+                }
+            }
+        }
+        value["workers"] = json!(
+            workers
+                .iter()
+                .map(|id| self.get(id).map(|r| r.body))
+                .collect::<Result<Vec<_>>>()?
+        );
+        value["sessions"] = json!(
+            sessions
+                .iter()
+                .map(|id| self.get(id).map(|r| r.body))
+                .collect::<Result<Vec<_>>>()?
+        );
+        Document::parse(&value)
+    }
+    pub fn import(&mut self, p: &Value) -> Result<Value> {
+        let values = p
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("documents must be a TTJ document array"))?;
+        let document = Document::merge(
+            values
+                .iter()
+                .map(Document::parse)
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let mut pending = vec![];
+        for worker in document.workers {
+            pending.push(("worker", None, document::to_value(&worker), 0));
+        }
+        for session in document.sessions {
+            pending.push(("session", None, document::to_value(&session), 0));
+        }
+        if let Some(mut project) = document.project {
+            let tasks = std::mem::take(&mut project.tasks);
+            let knowledge = std::mem::take(&mut project.knowledge);
+            pending.push(("project", None, document::to_value(&project), 0));
+            for knowledge in knowledge {
+                pending.push((
+                    "knowledge",
+                    Some(project.id.clone()),
+                    document::to_value(&knowledge),
+                    0,
+                ));
+            }
+            for task in tasks {
+                pending.push((
+                    "task",
+                    Some(project.id.clone()),
+                    document::to_value(&task),
+                    0,
+                ));
+            }
+        }
+        for mut ticket in document.tickets {
+            let jobs = std::mem::take(&mut ticket.jobs);
+            pending.push((
+                "ticket",
+                Some(ticket.task_id.clone()),
+                document::to_value(&ticket),
+                0,
+            ));
+            for (order, mut job) in jobs.into_iter().enumerate() {
+                let runs = std::mem::take(&mut job.runs);
+                pending.push((
+                    "job",
+                    Some(ticket.id.clone()),
+                    document::to_value(&job),
+                    order,
+                ));
+                for (order, run) in runs.into_iter().enumerate() {
+                    pending.push(("run", Some(job.id.clone()), document::to_value(&run), order));
+                }
+            }
+        }
+        let mut count = 0;
+        for (kind, parent, body, order) in pending {
+            let id = text(&body, "id")?;
+            if let Some(old) = self.rows.get(&id) {
+                if matches!(kind, "worker" | "session")
+                    && !old.deleted
+                    && old.kind == kind
+                    && old.body == body
+                {
+                    continue;
+                }
+                return Err(conflict());
+            }
+            if self.reserved_ids.contains(&id) {
+                return Err(conflict());
+            }
+            if let Some(parent) = &parent {
+                self.get(parent)?;
+            }
+            if kind == "session" && self.get(&text(&body, "worker_id")?)?.kind != "worker" {
+                return Err(rule("Session needs a Worker"));
+            }
+            if kind == "ticket" {
+                let task = self.get(&text(&body, "task_id")?)?;
+                if task.kind != "task" || (terminal(&task.body) && !terminal(&body)) {
+                    return Err(rule("Ticket needs a Task"));
+                }
+                self.check_session(&body)?;
+            }
+            let active = kind == "run" && body.get("result").is_none();
+            let started = active || matches!(body["status"].as_str(), Some("doing" | "completed"));
+            self.insert(kind, parent, body, json!({}))?;
+            let mut row = self.get(&id)?;
+            row.active = active;
+            row.started = started;
+            row.flags["order"] = json!(order);
+            if row.kind == "job" || row.kind == "task" {
+                row.flags["blocked"] = json!(row.body["status"] == "blocked");
+                row.flags["waiting"] = json!(row.body["status"] == "waiting");
+            }
+            self.save(row, "record.imported")?;
+            count += 1;
+        }
+        let imported: Vec<_> = self
+            .rows
+            .values()
+            .filter(|r| !r.deleted && matches!(r.kind.as_str(), "task" | "ticket" | "job"))
+            .cloned()
+            .collect();
+        for mut row in imported {
+            if !row.started && self.descendants(&row.id).iter().any(|r| r.kind == "run") {
+                row.started = true;
+                self.save(row, "record.imported")?;
+            }
+        }
+        let imported_tickets: Vec<_> = self
+            .changes
+            .iter()
+            .filter(|change| change.event == "record.created" && change.row.kind == "ticket")
+            .map(|change| change.row.id.clone())
+            .collect();
+        for id in imported_tickets {
+            let mut row = self.get(&id)?;
+            let (ready, blocked) = self.dependencies(&row)?;
+            let current = self.current(&row)?;
+            row.flags["blocked"] = json!(
+                row.body["status"] == "blocked"
+                    && !blocked
+                    && !current
+                        .as_ref()
+                        .is_some_and(|job| job.body["status"] == "blocked")
+            );
+            row.flags["waiting"] = json!(
+                row.body["status"] == "waiting"
+                    && ready
+                    && !current.as_ref().is_some_and(|job| matches!(
+                        job.body["status"].as_str(),
+                        Some("waiting" | "paused")
+                    ))
+            );
+            self.save(row, "record.imported")?;
+        }
+        for ticket in self
+            .rows
+            .values()
+            .filter(|r| r.kind == "ticket" && !r.deleted)
+        {
+            let body = self.record_body(ticket);
+            Self::validate("ticket", &body)?;
+            for id in strings(&body, "depends", false)? {
+                if self.raw(&id)?.kind != "ticket" {
+                    return Err(rule("depends must reference Tickets"));
+                }
+            }
+            self.dependencies(ticket)?;
+        }
+        self.check_cycles()?;
+        Ok(json!({"imported": count}))
+    }
     pub fn apply(&mut self, method: &str, p: &Value) -> Result<Value> {
         match method {
+            "document.import" => self.import(p),
             "task.purge" => self.purge_task(p),
             "status.set" => self.set_status(p),
             "run.start" => self.start_run(p),
             "run.finish" => self.finish_run(p),
+            "run.wait" => self.wait_run(p),
             _ => {
                 let (kind, action) = method
                     .split_once('.')
@@ -1101,64 +1366,41 @@ impl Engine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_ids_skip_deleted_and_reserved_records() {
-        let deleted = record::Model {
-            id: "job-00000000".into(),
-            kind: "job".into(),
-            parent: None,
-            body: json!({"id":"job-00000000"}),
-            revision: 1,
-            started: false,
-            deleted: true,
-            active: false,
-            flags: json!({}),
-        };
-        let engine = Engine {
-            rows: BTreeMap::from([(deleted.id.clone(), deleted)]),
-            reserved_ids: BTreeSet::from(["job-20000000".into()]),
-            changes: vec![],
-            actor: vec!["operator".into()],
-            reason: "Test ID reservation".into(),
-            now: "2026-01-01T00:00:00Z".into(),
-        };
-        let mut reserved = BTreeSet::from(["job-10000000".into()]);
-        let mut body = json!({});
-        let mut attempts = 0;
-        engine
-            .assign_id_with("job", &mut body, &mut reserved, || {
-                let candidate = attempts;
-                attempts += 1;
-                candidate
-            })
-            .unwrap();
-        assert_eq!(attempts, 4);
-        assert_eq!(body["id"], "job-30000000");
-        assert!(reserved.contains("job-30000000"));
-        for id in [
-            "job-00000000",
-            "job-10000000",
-            "job-20000000",
-            "job-30000000",
-        ] {
-            assert_eq!(
-                engine
-                    .assign_id("job", &mut json!({"id":id}), &mut reserved)
-                    .unwrap_err()
-                    .code,
-                -32009
-            );
+fn omit_empty_arrays(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
+            for child in object.values_mut() {
+                omit_empty_arrays(child);
+            }
         }
-        let mut legacy = json!({"id":"550e8400-e29b-41d4-a716-446655440000"});
-        engine
-            .assign_id_with("job", &mut legacy, &mut reserved, || {
-                panic!("explicit IDs must not be regenerated")
-            })
-            .unwrap();
-        assert_eq!(legacy["id"], "550e8400-e29b-41d4-a716-446655440000");
+        Value::Array(items) => {
+            for item in items {
+                omit_empty_arrays(item);
+            }
+        }
+        _ => {}
     }
+}
+
+fn initial_status(body: &mut Value) -> Result<()> {
+    if body.get("status").is_some_and(|status| status != "todo") {
+        return Err(invalid(
+            "New work must start as todo; use status.set or document.import",
+        ));
+    }
+    body["status"] = json!("todo");
+    Ok(())
+}
+fn increment(number: &str) -> String {
+    let mut bytes = number.as_bytes().to_vec();
+    for byte in bytes.iter_mut().rev() {
+        if *byte < b'9' {
+            *byte += 1;
+            return String::from_utf8(bytes).unwrap();
+        }
+        *byte = b'0';
+    }
+    bytes.insert(0, b'1');
+    String::from_utf8(bytes).unwrap()
 }

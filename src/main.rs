@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 use ttjcore::{PROTOCOL, ipc, store::Store};
-const HELP: &str = "TTJCore: TTJ 1.0.0 local CLI and shared IPC service
+const HELP: &str = "TTJCore: TTJ 1.1.0 local CLI and shared IPC service
 Usage:
   ttjcore [--home PROFILE] ensure
   ttjcore init
@@ -10,6 +10,8 @@ Usage:
   ttjcore methods
   ttjcore call METHOD [--params JSON | --file FILE]
   ttjcore rpc
+  ttjcore export PROJECT (--file FILE | --directory DIR)
+  ttjcore import --file FILE [--file FILE ...] --actor JSON --reason TEXT [--operation ID]
 Environment:
   TTJCORE_DATABASE_URL selects SQLite (default) or PostgreSQL for ensure/init/serve.
   TTJCORE_HOME selects the local Core profile for every command.
@@ -90,6 +92,51 @@ async fn run() -> std::result::Result<(), String> {
     }
     if command == "rpc" {
         return ipc::bridge(&home).await.map_err(|e| e.to_string());
+    }
+    if command == "export" {
+        if args.len() != 4 || !matches!(args[2].as_str(), "--file" | "--directory") {
+            return Err("Use export PROJECT (--file FILE | --directory DIR)".into());
+        }
+        let response = ipc::call(&home, json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":1,"method":"document.export","params":{"project":args[1]}})).await.map_err(|e| e.to_string())?;
+        if let Some(error) = response.get("error") {
+            return Err(error.to_string());
+        }
+        let document =
+            ttjcore::document::Document::parse(&response["result"]).map_err(|e| e.message)?;
+        if args[2] == "--file" {
+            document.write(&args[3]).map_err(|e| e.message)?;
+        } else {
+            document.write_split(&args[3]).map_err(|e| e.message)?;
+        }
+        println!("{}", json!({"protocol":PROTOCOL,"exported":true}));
+        return Ok(());
+    }
+    if command == "import" {
+        let mut documents = vec![];
+        let mut params = json!({});
+        let mut index = 1;
+        while index < args.len() {
+            let key = &args[index];
+            let value = args.get(index + 1).ok_or("Import options require values")?;
+            match key.as_str() {
+                "--file" => documents.push(ttjcore::document::Document::read(value).map_err(|e| e.message)?.to_value()),
+                "--actor" => params["actor"] = serde_json::from_str(value).map_err(|_| "actor must be a JSON array")?,
+                "--reason" => params["reason"] = json!(value),
+                "--operation" => params["operation"] = json!(value),
+                _ => return Err("Use import --file FILE [--file FILE ...] --actor JSON --reason TEXT [--operation ID]".into()),
+            }
+            index += 2;
+        }
+        if documents.is_empty() {
+            return Err("import requires at least one --file".into());
+        }
+        params["documents"] = json!(documents);
+        let response = ipc::call(&home, json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":1,"method":"document.import","params":params})).await.map_err(|e| e.to_string())?;
+        println!("{response}");
+        if response.get("error").is_some() {
+            std::process::exit(2);
+        }
+        return Ok(());
     }
     if command != "call" {
         return Err("Unknown command. Use ttjcore --help".into());

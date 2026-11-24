@@ -7,11 +7,11 @@
 
 ## 概要
 
-[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、ProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.1です。
+[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.1です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
-Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。終了したTaskは`task.purge`で配下を一括物理削除し、要約履歴とProjectのKnowledgeを残せます。既存の`delete`操作は履歴・依存参照を残す論理削除です。
+Taskは単一のproject内に置き、Ticketはルートtickets配列からtask_idでTaskを参照します。WorkerとSessionでTicketの固定担当を識別します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。終了したTaskは`task.purge`で配下を一括物理削除し、要約履歴とProjectのKnowledgeを残せます。既存の`delete`操作は履歴・依存参照を残す論理削除です。
 
 ## クイックスタート
 
@@ -20,7 +20,6 @@ Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticke
 ```sh
 git clone https://github.com/northwest-systems/TTJCore.git
 cd TTJCore
-git checkout v0.1.1
 cargo install --path . --locked
 ttjcore ensure
 ttjcore call project.list
@@ -47,13 +46,14 @@ TTJCore/                        # Rust製CLI・Core
 ├── skills/                     # LLM向け利用スキル
 │   └── ttjcore/                # Coreの利用スキル
 │       ├── references/         # 仕様の参照資料
-│       │   ├── ttj-1.0.0/      # オフラインで読む固定版のTTJ規格
-│       │   │   ├── json-format.md    # TTJの項目と記入例
-│       │   │   ├── LICENSE           # TTJ規格のApache-2.0ライセンス
-│       │   │   └── specification.md  # TTJ 1.0.0の作業規則
+│       │   ├── ttj-1.1.0/      # オフラインのTTJ規格・skill
+│       │   │   ├── SKILL.md
+│       │   │   ├── LICENSE
+│       │   │   └── references/ # specification・json-format・use-cases
 │       │   └── protocol.md     # CLI・JSON-RPC・eventの仕様
 │       └── SKILL.md            # LLM向けの操作手順
 ├── src/                        # Rustソース
+│   ├── document.rs             # TTJ 1.1.0の型・検証・ファイル分割
 │   ├── engine.rs               # TTJの規則・CRUD・status変更
 │   ├── entity.rs               # SeaORMのtable定義
 │   ├── ipc.rs                  # ローカルIPC・stdio bridge
@@ -64,6 +64,7 @@ TTJCore/                        # Rust製CLI・Core
 │   └── store.rs                # ORM・transaction・変更通知
 ├── tests/                      # 自動テスト
 │   ├── contract.rs             # SQLite・PostgreSQLの動作契約
+│   ├── document.rs             # 1.1.0の入出力・連番・Session・待機循環
 │   ├── ipc.rs                  # IPC経由の呼び出し
 │   ├── purge.rs                # Task物理削除・要約履歴・容量回収
 │   └── startup.rs              # Coreの自動起動・停止
@@ -120,7 +121,7 @@ DB設定はensure・init・serveが使います。call・rpc・Herdrは同じpro
 
 CLI・JSON-RPC・eventの仕様は[protocol](skills/ttjcore/references/protocol.md)、LLM向けの入口は[skills/ttjcore/SKILL.md](skills/ttjcore/SKILL.md)です。
 
-Skillには[TTJ 1.0.0規格本文](skills/ttjcore/references/ttj-1.0.0/specification.md)・[JSON参照形式](skills/ttjcore/references/ttj-1.0.0/json-format.md)とライセンスを固定版として同梱しています。`skills/ttjcore`を参照資料ごとコピーすれば、ネット接続なしでTTJの規則とCoreの操作を確認できます。
+Skillには[TTJ 1.1.0規格本文](skills/ttjcore/references/ttj-1.1.0/references/specification.md)・[JSON参照形式](skills/ttjcore/references/ttj-1.1.0/references/json-format.md)とライセンスを固定版として同梱しています。`skills/ttjcore`を参照資料ごとコピーすれば、ネット接続なしでTTJの規則とCoreの操作を確認できます。
 
 ## テスト
 

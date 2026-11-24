@@ -6,7 +6,7 @@ use ttjcore::{
 };
 
 async fn change(db: &Store, method: &str, mut params: Value) -> ttjcore::Result<Value> {
-    params["actor"] = json!(["operator"]);
+    params["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
     if method != "task.purge" {
         params["reason"] = json!("Fixture operation");
     }
@@ -31,36 +31,50 @@ async fn status(db: &Store, kind: &str, id: &str, status: &str) {
 async fn seed(db: &Store, detail: &str) -> Value {
     change(
         db,
-        "project.create",
-        json!({"operation":"project-create","record":{"id":"project","name":"Example"}}),
+        "worker.create",
+        json!({"record":{"id":"wkr-abcdef-1","name":"Operator"}}),
     )
     .await
     .unwrap();
-    let create = json!({"operation":"task-create","record":{"id":"task","project":"project","objective":"Publish example","criteria":["Published"]}});
+    change(
+        db,
+        "session.create",
+        json!({"record":{"id":"ssn-abcdef-1","worker_id":"wkr-abcdef-1"}}),
+    )
+    .await
+    .unwrap();
+    change(
+        db,
+        "project.create",
+        json!({"operation":"project-create","record":{"id":"pj-abcdef-1","name":"Example"}}),
+    )
+    .await
+    .unwrap();
+    let create = json!({"operation":"task-create","parent":"pj-abcdef-1","record":{"id":"tsk-abcdef-1","objective":"Publish example","criteria":["Published"]}});
     change(db, "task.create", create.clone()).await.unwrap();
-    change(db,"ticket.create",json!({"operation":"ticket-create","record":{"id":"ticket","task":"task","objective":"Prepare example","jobs":[
-        {"id":"job","objective":"Check example","criteria":["Checked"],"instructions":detail}]}})).await.unwrap();
-    change(db,"knowledge.create",json!({"record":{"id":"knowledge","project":"project","content":"Durable project knowledge","basis":"Verified finding"}})).await.unwrap();
+    change(db,"ticket.create",json!({"operation":"ticket-create","record":{"id":"tkt-abcdef-1","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-1","objective":"Prepare example","jobs":[
+        {"id":"job-abcdef-1","objective":"Check example","criteria":["Checked"],"instructions":detail}]}})).await.unwrap();
+    change(db,"knowledge.create",json!({"parent":"pj-abcdef-1","record":{"id":"knowledge","content":"Durable project knowledge","basis":"Verified finding"}})).await.unwrap();
     create
 }
 async fn finish_work(db: &Store, detail: &str) {
-    let job = get(db, "job", "job").await;
+    let job = get(db, "job", "job-abcdef-1").await;
     change(
         db,
         "run.start",
-        json!({"id":"run","job":"job","revision":job["revision"]}),
+        json!({"id":"run-abcdef-1","job":"job-abcdef-1","revision":job["revision"]}),
     )
     .await
     .unwrap();
-    let run = get(db, "run", "run").await;
+    let run = get(db, "run", "run-abcdef-1").await;
     change(
         db,
         "run.finish",
-        json!({"id":"run","revision":run["revision"],"result":detail}),
+        json!({"id":"run-abcdef-1","revision":run["revision"],"result":detail}),
     )
     .await
     .unwrap();
-    status(db, "job", "job", "completed").await;
+    status(db, "job", "job-abcdef-1", "completed").await;
 }
 
 #[tokio::test]
@@ -74,12 +88,12 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
     let detail = "ARCHIVED_DETAIL_".repeat(8192);
     let create = seed(&db, &detail).await;
     finish_work(&db, &detail).await;
-    status(&db, "task", "task", "completed").await;
-    let task = get(&db, "task", "task").await;
+    status(&db, "task", "tsk-abcdef-1", "completed").await;
+    let task = get(&db, "task", "tsk-abcdef-1").await;
     change(
         &db,
         "task.delete",
-        json!({"id":"task","revision":task["revision"]}),
+        json!({"id":"tsk-abcdef-1","revision":task["revision"]}),
     )
     .await
     .unwrap();
@@ -103,18 +117,21 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
         .unwrap();
     let before = std::fs::metadata(&path).unwrap().len();
     let task = db
-        .call("task.get", json!({"id":"task","include_deleted":true}))
+        .call(
+            "task.get",
+            json!({"id":"tsk-abcdef-1","include_deleted":true}),
+        )
         .await
         .unwrap();
-    let params = json!({"operation":"purge-once","id":"task","revision":task["revision"]});
+    let params = json!({"operation":"purge-once","id":"tsk-abcdef-1","revision":task["revision"]});
     let result = change(&db, "task.purge", params.clone()).await.unwrap();
     assert_eq!(result["value"]["records"], 4);
     assert_eq!(result["value"]["storage"], "reclaimed");
     for (kind, id) in [
-        ("task", "task"),
-        ("ticket", "ticket"),
-        ("job", "job"),
-        ("run", "run"),
+        ("task", "tsk-abcdef-1"),
+        ("ticket", "tkt-abcdef-1"),
+        ("job", "job-abcdef-1"),
+        ("run", "run-abcdef-1"),
     ] {
         assert_eq!(
             db.call(
@@ -127,17 +144,17 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
             -32004
         );
     }
-    assert_eq!(record::Entity::find().all(&db.db).await.unwrap().len(), 2);
+    assert_eq!(record::Entity::find().all(&db.db).await.unwrap().len(), 4);
     let timeline = db
-        .call("timeline.list", json!({"project":"project"}))
+        .call("timeline.list", json!({"project":"pj-abcdef-1"}))
         .await
         .unwrap();
     for (target, kind) in [
-        ("task", "task"),
-        ("ticket", "ticket"),
-        ("job", "job"),
-        ("run", "run"),
-        ("project", "project"),
+        ("tsk-abcdef-1", "task"),
+        ("tkt-abcdef-1", "ticket"),
+        ("job-abcdef-1", "job"),
+        ("run-abcdef-1", "run"),
+        ("pj-abcdef-1", "project"),
         ("knowledge", "knowledge"),
     ] {
         let events: Vec<_> = timeline
@@ -146,8 +163,16 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
             .iter()
             .filter(|event| event["target"] == target)
             .collect();
+        assert!(!events.is_empty());
         assert!(events.iter().all(|event| event["kind"] == kind));
-        if ["task", "ticket", "job", "run"].contains(&target) {
+        if [
+            "tsk-abcdef-1",
+            "tkt-abcdef-1",
+            "job-abcdef-1",
+            "run-abcdef-1",
+        ]
+        .contains(&target)
+        {
             assert!(events.iter().all(|event| event["to"]["kind"] == kind));
         }
     }
@@ -157,7 +182,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| event["target"] == "task"
+            .any(|event| event["target"] == "tsk-abcdef-1"
                 && event["event"] == "record.deleted"
                 && event["reason"] == "Taskを削除")
     );
@@ -166,7 +191,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| event["target"] == "ticket"
+            .any(|event| event["target"] == "tkt-abcdef-1"
                 && event["to"]["record"]["objective"] == "Prepare example")
     );
     assert_eq!(
@@ -178,7 +203,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| event["target"] == "run"
+            .any(|event| event["target"] == "run-abcdef-1"
                 && event["to"]["record"]["objective"] == "Check example")
     );
     let operations = operation::Entity::find().all(&db.db).await.unwrap();
@@ -187,7 +212,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
         change(&db, "task.create", create).await.unwrap_err().code,
         -32009
     );
-    assert_eq!(change(&db,"task.create",json!({"record":{"id":"task","project":"project","objective":"Reuse","criteria":["No"]}})).await.unwrap_err().code,-32009);
+    assert_eq!(change(&db,"task.create",json!({"parent":"pj-abcdef-1","record":{"id":"tsk-abcdef-1","objective":"Reuse","criteria":["No"]}})).await.unwrap_err().code,-32009);
     let count = history::Entity::find().all(&db.db).await.unwrap().len();
     assert_eq!(change(&db, "task.purge", params).await.unwrap(), result);
     assert_eq!(
@@ -206,12 +231,12 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
 async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_names() {
     let db = Store::connect("sqlite::memory:", true).await.unwrap();
     seed(&db, "Instructions").await;
-    let task = get(&db, "task", "task").await;
+    let task = get(&db, "task", "tsk-abcdef-1").await;
     assert_eq!(
         change(
             &db,
             "task.purge",
-            json!({"id":"task","revision":task["revision"]})
+            json!({"id":"tsk-abcdef-1","revision":task["revision"]})
         )
         .await
         .unwrap_err()
@@ -219,36 +244,36 @@ async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_
         -32010
     );
     finish_work(&db, "Run result").await;
-    let task = get(&db, "task", "task").await;
+    let task = get(&db, "task", "tsk-abcdef-1").await;
     assert_eq!(task["record"]["status"], "doing");
     assert_eq!(
         change(
             &db,
             "task.purge",
-            json!({"id":"task","revision":task["revision"]})
+            json!({"id":"tsk-abcdef-1","revision":task["revision"]})
         )
         .await
         .unwrap_err()
         .code,
         -32010
     );
-    status(&db, "task", "task", "canceled").await;
+    status(&db, "task", "tsk-abcdef-1", "canceled").await;
     change(
         &db,
         "project.create",
-        json!({"record":{"id":"other-project","name":"Other"}}),
+        json!({"record":{"id":"pj-abcdef-2","name":"Other"}}),
     )
     .await
     .unwrap();
-    change(&db,"task.create",json!({"record":{"id":"other-task","project":"other-project","objective":"Continue","criteria":["Ready"]}})).await.unwrap();
-    change(&db,"ticket.create",json!({"record":{"id":"other-ticket","task":"other-task","objective":"Depend","depends":["ticket"],"jobs":[{"id":"other-job","objective":"Continue","criteria":["Ready"]}]}})).await.unwrap();
-    let task = get(&db, "task", "task").await;
+    change(&db,"task.create",json!({"parent":"pj-abcdef-2","record":{"id":"tsk-abcdef-2","objective":"Continue","criteria":["Ready"]}})).await.unwrap();
+    change(&db,"ticket.create",json!({"record":{"id":"tkt-abcdef-2","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-2","objective":"Depend","depends":["tkt-abcdef-1"],"jobs":[{"id":"job-abcdef-2","objective":"Continue","criteria":["Ready"]}]}})).await.unwrap();
+    let task = get(&db, "task", "tsk-abcdef-1").await;
     let count = history::Entity::find().all(&db.db).await.unwrap().len();
     assert_eq!(
         change(
             &db,
             "task.purge",
-            json!({"id":"task","revision":task["revision"]})
+            json!({"id":"tsk-abcdef-1","revision":task["revision"]})
         )
         .await
         .unwrap_err()
@@ -259,17 +284,17 @@ async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_
         history::Entity::find().all(&db.db).await.unwrap().len(),
         count
     );
-    assert_eq!(get(&db, "task", "task").await, task);
-    let external = get(&db, "ticket", "other-ticket").await;
+    assert_eq!(get(&db, "task", "tsk-abcdef-1").await, task);
+    let external = get(&db, "ticket", "tkt-abcdef-2").await;
     change(
         &db,
         "ticket.update",
-        json!({"id":"other-ticket","revision":external["revision"],"patch":{"depends":[]}}),
+        json!({"id":"tkt-abcdef-2","revision":external["revision"],"patch":{"depends":[]}}),
     )
     .await
     .unwrap();
     assert_eq!(
-        change(&db, "task.purge", json!({"id":"task","revision":1}))
+        change(&db, "task.purge", json!({"id":"tsk-abcdef-1","revision":1}))
             .await
             .unwrap_err()
             .code,
@@ -278,12 +303,12 @@ async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_
     change(
         &db,
         "task.purge",
-        json!({"id":"task","revision":task["revision"]}),
+        json!({"id":"tsk-abcdef-1","revision":task["revision"]}),
     )
     .await
     .unwrap();
     let snapshot = db
-        .call("project.snapshot", json!({"id":"other-project"}))
+        .call("project.snapshot", json!({"id":"pj-abcdef-2"}))
         .await
         .unwrap();
     assert_eq!(
@@ -293,7 +318,7 @@ async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_
     assert_eq!(snapshot["dependencies"][0]["physical"], true);
     assert_eq!(snapshot["dependencies"][0]["deleted"], true);
     assert_eq!(
-        get(&db, "ticket", "other-ticket").await["record"]["depends"],
-        json!([])
+        get(&db, "ticket", "tkt-abcdef-2").await["record"]["depends"],
+        Value::Null
     );
 }

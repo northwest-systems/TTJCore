@@ -31,7 +31,7 @@ pub async fn dispatch(store: &Store, wire: &str) -> Option<Value> {
         }
         let notification = request.get("id").is_none();
         let response = if request["protocol"] != PROTOCOL {
-            failure(id, -32602, "protocol must be TTJ/1.0.0")
+            failure(id, -32602, &format!("protocol must be {PROTOCOL}"))
         } else {
             match store
                 .call(

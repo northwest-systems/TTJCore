@@ -70,7 +70,11 @@ impl Store {
         if method == "rpc.discover" {
             return Ok(discover());
         }
-        if method.ends_with(".get") || method.ends_with(".list") || method == "project.snapshot" {
+        if method.ends_with(".get")
+            || method.ends_with(".list")
+            || method == "project.snapshot"
+            || method == "document.export"
+        {
             let isolation = if self.db.get_database_backend() == sea_orm::DbBackend::Postgres {
                 Some(sea_orm::IsolationLevel::RepeatableRead)
             } else {
@@ -181,10 +185,10 @@ impl Store {
                 let summarize = |value| {
                     let mut summary = history_summary(value);
                     summary["kind"] = json!(kinds.get(&event.target));
-                    if summary["record"].get("objective").is_none() {
-                        if let Some(name) = names.get(&event.target) {
-                            summary["record"]["objective"] = name.clone();
-                        }
+                    if summary["record"].get("objective").is_none()
+                        && let Some(name) = names.get(&event.target)
+                    {
+                        summary["record"]["objective"] = name.clone();
                     }
                     summary
                 };
@@ -378,17 +382,22 @@ impl Store {
 }
 
 fn is_mutation(method: &str) -> bool {
-    if method == "task.purge" {
+    if matches!(method, "task.purge" | "document.import") {
         return true;
     }
-    if matches!(method, "status.set" | "run.start" | "run.finish") {
+    if matches!(
+        method,
+        "status.set" | "run.start" | "run.finish" | "run.wait"
+    ) {
         return true;
     }
     let Some((kind, action)) = method.split_once('.') else {
         return false;
     };
-    matches!(kind, "project" | "task" | "ticket" | "job" | "knowledge")
-        && matches!(action, "create" | "update" | "delete")
+    matches!(
+        kind,
+        "project" | "task" | "ticket" | "job" | "knowledge" | "worker" | "session"
+    ) && matches!(action, "create" | "update" | "delete")
 }
 fn read(
     method: &str,
@@ -407,6 +416,9 @@ fn read(
         reason: String::new(),
         now: String::new(),
     };
+    if method == "document.export" {
+        return Ok(engine.export(p)?.to_value());
+    }
     if method == "timeline.list" {
         let project = text(p, "project")?;
         let row = if p["include_deleted"] == true {
@@ -441,14 +453,19 @@ fn read(
                 r.kind == "ticket" && !r.deleted && r.parent.as_deref() == Some(task.id.as_str())
             }) {
                 dependency_ids.extend(strings(&ticket.body, "depends", false)?);
-                let jobs: Vec<_> = strings(&ticket.body, "jobs", true)?
-                    .iter()
-                    .filter_map(|id| engine.rows.get(id))
-                    .map(view)
+                let mut job_rows: Vec<_> = engine
+                    .rows
+                    .values()
+                    .filter(|r| r.kind == "job" && r.parent.as_deref() == Some(ticket.id.as_str()))
                     .collect();
-                tickets.push(json!({"ticket":view(ticket),"jobs":jobs}));
+                job_rows.sort_by_key(|r| r.flags["order"].as_u64().unwrap_or(0));
+                let jobs: Vec<_> = job_rows
+                    .into_iter()
+                    .map(|r| engine.record_view(r))
+                    .collect();
+                tickets.push(json!({"ticket":engine.record_view(ticket),"jobs":jobs}));
             }
-            tasks.push(json!({"task":view(task),"tickets":tickets}));
+            tasks.push(json!({"task":engine.record_view(task),"tickets":tickets}));
         }
         let knowledge: Vec<_> = engine
             .rows
@@ -459,7 +476,7 @@ fn read(
                     && r.parent.as_deref() == Some(project.id.as_str())
                     && r.body["status"] == "active"
             })
-            .map(view)
+            .map(|r| engine.record_view(r))
             .collect();
         let timeline = timeline(&project.id, &events, &engine.rows);
         for event in timeline.as_array().unwrap() {
@@ -474,7 +491,7 @@ fn read(
             .iter()
             .filter_map(|id| {
                 if let Some(row) = engine.rows.get(id) {
-                    return (row.kind == "ticket").then(|| view(row));
+                    return (row.kind == "ticket").then(|| engine.record_view(row));
                 }
                 let event = events.iter().rev().find(|event| event.target == *id)?;
                 let mut summary = event.after.clone().or_else(|| event.before.clone())?;
@@ -485,7 +502,7 @@ fn read(
             })
             .collect();
         return Ok(
-            json!({"project":view(&project),"tasks":tasks,"timeline":timeline,"knowledge":knowledge,"dependencies":dependencies}),
+            json!({"project":engine.record_view(&project),"tasks":tasks,"timeline":timeline,"knowledge":knowledge,"dependencies":dependencies}),
         );
     }
     let (kind, action) = method
@@ -493,7 +510,7 @@ fn read(
         .ok_or_else(|| invalid("Unknown method"))?;
     if !matches!(
         kind,
-        "project" | "task" | "ticket" | "job" | "run" | "knowledge"
+        "project" | "task" | "ticket" | "job" | "run" | "knowledge" | "worker" | "session"
     ) {
         return Err(crate::Error {
             code: -32601,
@@ -511,7 +528,7 @@ fn read(
                 code: -32004,
                 message: "Record not found".into(),
             })?;
-        return Ok(view(row));
+        return Ok(engine.record_view(row));
     }
     if action == "list" {
         let parent = p.get("parent").map(|_| text(p, "parent")).transpose()?;
@@ -528,12 +545,12 @@ fn read(
             {
                 continue;
             }
-            if let Some(project) = &project {
-                if engine.project(row)? != *project {
-                    continue;
-                }
+            if let Some(project) = &project
+                && engine.project(row)? != *project
+            {
+                continue;
             }
-            list.push(view(row));
+            list.push(engine.record_view(row));
         }
         return Ok(json!({"items":list}));
     }
@@ -561,7 +578,16 @@ fn timeline(
 }
 pub fn discover() -> Value {
     let mut methods = vec![];
-    for kind in ["project", "task", "ticket", "job", "run", "knowledge"] {
+    for kind in [
+        "project",
+        "task",
+        "ticket",
+        "job",
+        "run",
+        "knowledge",
+        "worker",
+        "session",
+    ] {
         for action in ["get", "list"] {
             methods.push(json!({"name":format!("{kind}.{action}"),"mutates":false,
                 "required":if action=="get" {vec!["id"]} else {vec![]}}));
@@ -572,13 +598,16 @@ pub fn discover() -> Value {
                     continue;
                 }
                 methods.push(json!({"name":format!("{kind}.{action}"),"mutates":true,
-                    "required":if action=="create" {vec!["actor","reason","record"]}
+                    "required":if action=="create" {if matches!(kind,"task"|"knowledge") {vec!["actor","reason","parent","record"]} else {vec!["actor","reason","record"]}}
                         else if action=="update" {vec!["actor","reason","id","revision","patch"]}
                         else {vec!["actor","reason","id","revision"]}}));
             }
         }
     }
     methods.extend([
+        json!({"name":"document.export","mutates":false,"required":[],"optional":["project","tickets"]}),
+        json!({"name":"document.import","mutates":true,"required":["actor","reason","documents"]}),
+        json!({"name":"run.wait","mutates":true,"required":["actor","reason","id","revision","wait"]}),
         json!({"name":"task.purge","mutates":true,"required":["actor","id","revision"],
             "description":"Physically remove a terminal Task and all descendants; retain summary history and Knowledge; reject external Ticket references"}),
         json!({"name":"core.stop","mutates":false,"required":[],"transport":"IPC service control"}),
@@ -594,26 +623,27 @@ pub fn discover() -> Value {
     json!({"methods":methods,
         "record_fields":{
             "project":{"required":["name"]},
-            "task":{"required":["project","objective","criteria"],"optional":["deadline"]},
-            "ticket":{"required":["task","objective","jobs"],"optional":["assignee","depends","handoffs","resume","priority"],
-                "jobs":"Non-empty array of complete Job objects; IDs and order are fixed atomically"},
-            "job":{"required":["objective","criteria"],"optional":["instructions","assignee"]},
-            "knowledge":{"required":["project","content","basis"],"optional":["supersedes"]}
+            "task":{"required":["objective","criteria"],"parent":"Project ID in params.parent","optional":["deadline","resume","handoff","status"]},
+            "worker":{"required":["name"]},
+            "session":{"required":["worker_id"],"optional":["started","ended"]},
+            "ticket":{"required":["task_id","worker_id","session_id","objective"],"optional":["jobs","exclusions","depends","refs","artifacts","resume","status"],
+                "jobs":"Array of complete Job objects; IDs and order are fixed atomically"},
+            "job":{"required":["objective","criteria"],"optional":["instructions","status"]},
+            "knowledge":{"required":["content","basis"],"parent":"Project ID in params.parent","optional":["supersedes"]}
         },
         "field_types":{
             "criteria":"Non-empty array of non-empty strings",
-            "actor":"Non-empty array of participant identifiers",
-            "assignee":"Array of identifiers; omitted Job value inherits Ticket value",
+            "actor":"Management actor identifiers, or [worker_id, session_id] for Run execution",
             "depends":"Array of Ticket IDs",
-            "handoffs":"Array of short strings",
+            "handoff":"Single volatile Task Handoff object",
             "deadline":"Timezone-qualified RFC 3339 datetime",
-            "id":"Globally unique non-empty string; when omitted, 8 lowercase alphanumeric characters with pj-/tsk-/tkt-/job- prefixes for Project/Task/Ticket/Job; Run/Knowledge have no prefix",
+            "id":"<pj|tsk|tkt|job|run|wkr|ssn>-<6 or 8 alphanumerics>-<positive increment without leading zeros>; generated when omitted. Knowledge IDs are separate.",
             "revision":"Integer returned by the latest read"
         },
         "editable_fields":{
-            "project":["name"],"task":["objective","criteria","deadline"],
-            "ticket":["assignee","depends","handoffs","resume","priority"],
-            "job":["assignee","resume"],"knowledge":["status"]
+            "project":["name"],"task":["objective","criteria","deadline","resume","handoff"],
+            "ticket":["depends","refs","artifacts","resume"],
+            "job":["result","artifacts","resume"],"knowledge":["status"],"worker":["name"],"session":["ended"]
         },
         "display_metadata":{"storage":"Outside TTJ record; returned as wrapper.display",
             "fields":{"summary":"Short string for cards","icon":"User-defined icon key"},

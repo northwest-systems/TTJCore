@@ -43,7 +43,7 @@ async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
     let mut writer = &stream;
     let mut reader = BufReader::new(&stream);
     let subscription = json!({"jsonrpc":"2.0","protocol":PROTOCOL,"auth":info["token"],"id":"subscribe",
-        "method":"events.subscribe","params":{"cursor":0,"project":"demo"}});
+        "method":"events.subscribe","params":{"cursor":0,"project":"pj-abcdef-1"}});
     writer
         .write_all(format!("{subscription}\n").as_bytes())
         .await
@@ -68,14 +68,14 @@ async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
         ipc::call(
             &wait_home,
             json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":2,
-            "method":"events.wait","params":{"cursor":0,"project":"demo","timeout_ms":1000}}),
+            "method":"events.wait","params":{"cursor":0,"project":"pj-abcdef-1","timeout_ms":1000}}),
         )
         .await
         .unwrap()
     });
     let create = json!({"jsonrpc":"2.0","protocol":PROTOCOL,"id":1,"method":"project.create",
         "params":{"actor":["operator"],"reason":"IPC contract","operation":"create-once",
-            "record":{"id":"demo","name":"Demo"}}});
+            "record":{"id":"pj-abcdef-1","name":"Demo"}}});
     let first = ipc::call(&home, create.clone()).await.unwrap();
     assert!(first.get("error").is_none());
     line.clear();
@@ -85,9 +85,12 @@ async fn ipc_delivers_committed_changes_and_replays_without_duplicate_events() {
         .unwrap();
     let notification: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(notification["method"], "ttj.changed");
-    assert_eq!(notification["params"]["events"][0]["project"], "demo");
+    assert_eq!(
+        notification["params"]["events"][0]["project"],
+        "pj-abcdef-1"
+    );
     let waited = waiting.await.unwrap();
-    assert_eq!(waited["result"]["events"][0]["target"], "demo");
+    assert_eq!(waited["result"]["events"][0]["target"], "pj-abcdef-1");
     assert_eq!(ipc::call(&home, create).await.unwrap(), first);
     let cursor = notification["params"]["cursor"].clone();
     let unchanged = ipc::call(
