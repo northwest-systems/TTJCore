@@ -29,6 +29,130 @@ ttjcore call project.list
 
 作成IDはCoreが自動発行します。停止は`ttjcore stop`です。クライアントを閉じてもCoreは動作を続けます。
 
+## サンプルProjectをコマンドで操作する
+
+インストール後、新しいPowerShell 7のターミナルで以下を順に実行します。専用の一時profileとSQLiteを使い、サンプルProjectの作成・名前の変更・取得結果の確認・作業完了までを記録します。既存のprofileは変更しません。
+
+### 1. Coreを起動し、担当者と作業計画を登録する
+
+このサンプルの管理主体は`sample-owner`です。Workerは作業担当者、Sessionはその実行単位として別々に登録します。作成結果の`result.value`には、発行されたIDとrevisionを含むrecordのwrapperが返ります。
+
+```powershell
+$sampleHome = Join-Path ([IO.Path]::GetTempPath()) ("ttj-sample-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+Remove-Item Env:TTJCORE_DATABASE_URL -ErrorAction SilentlyContinue
+$env:TTJCORE_MANAGEMENT_ACTORS = '["sample-owner"]'
+ttjcore --home $sampleHome ensure
+
+$request = @{
+    actor = @("sample-owner"); reason = "サンプルの担当者を登録する"
+    record = @{ name = "サンプル担当者" }
+} | ConvertTo-Json -Depth 6 -Compress
+$worker = (ttjcore --home $sampleHome call worker.create --params $request | ConvertFrom-Json).result.value
+
+$request = @{
+    actor = @("sample-owner"); reason = "担当者のSessionを開始する"
+    record = @{ worker_id = $worker.record.id }
+} | ConvertTo-Json -Depth 6 -Compress
+$session = (ttjcore --home $sampleHome call session.create --params $request | ConvertFrom-Json).result.value
+
+$request = @{
+    actor = @("sample-owner"); reason = "サンプルProjectを作成する"
+    record = @{ name = "CLIサンプル" }
+} | ConvertTo-Json -Depth 6 -Compress
+$project = (ttjcore --home $sampleHome call project.create --params $request | ConvertFrom-Json).result.value
+
+$request = @{
+    actor = @("sample-owner"); reason = "Projectの操作を確認するTaskを作成する"
+    parent = $project.record.id
+    record = @{ objective = "Projectの名前を変更して確認する"; criteria = @("変更後の名前をコマンドで確認できる") }
+} | ConvertTo-Json -Depth 6 -Compress
+$task = (ttjcore --home $sampleHome call task.create --params $request | ConvertFrom-Json).result.value
+
+$request = @{
+    actor = @("sample-owner"); reason = "担当SessionとJobを確定する"
+    record = @{
+        task_id = $task.record.id; worker_id = $worker.record.id; session_id = $session.record.id
+        objective = "Project名を更新して取得結果を確認する"
+        jobs = @(@{ objective = "Project名の更新と確認"; criteria = @("project.getのnameがCLIサンプル（確認済み）である") })
+    }
+} | ConvertTo-Json -Depth 6 -Compress
+$ticket = (ttjcore --home $sampleHome call ticket.create --params $request | ConvertFrom-Json).result.value
+$jobId = $ticket.record.jobs[0].id
+```
+
+### 2. Runを開始し、Project名を変更して確認する
+
+参照操作の結果は`result`に直接返ります。更新や実行開始には、対象の最新revisionを渡します。RunのactorはTicketに固定したWorker/Sessionの組です。
+
+```powershell
+$request = @{ id = $jobId } | ConvertTo-Json -Compress
+$job = (ttjcore --home $sampleHome call job.get --params $request | ConvertFrom-Json).result
+$request = @{
+    actor = @($worker.record.id, $session.record.id); reason = "名前の更新と確認を開始する"
+    job = $jobId; revision = $job.revision
+} | ConvertTo-Json -Compress
+$run = (ttjcore --home $sampleHome call run.start --params $request | ConvertFrom-Json).result.value.run
+
+$request = @{ id = $project.record.id } | ConvertTo-Json -Compress
+$project = (ttjcore --home $sampleHome call project.get --params $request | ConvertFrom-Json).result
+$request = @{
+    actor = @("sample-owner"); reason = "サンプルProjectの名前を変更する"
+    id = $project.record.id; revision = $project.revision
+    patch = @{ name = "CLIサンプル（確認済み）" }
+} | ConvertTo-Json -Depth 6 -Compress
+$project = (ttjcore --home $sampleHome call project.update --params $request | ConvertFrom-Json).result.value
+
+$request = @{ id = $project.record.id } | ConvertTo-Json -Compress
+$project = (ttjcore --home $sampleHome call project.get --params $request | ConvertFrom-Json).result
+if ($project.record.name -ne "CLIサンプル（確認済み）") { throw "Project名が一致しません" }
+$project.record | Select-Object id, name | Format-Table -AutoSize
+
+$request = @{ id = $run.record.id } | ConvertTo-Json -Compress
+$run = (ttjcore --home $sampleHome call run.get --params $request | ConvertFrom-Json).result
+$request = @{
+    actor = @($worker.record.id, $session.record.id); reason = "変更後のProject名を確認した"
+    id = $run.record.id; revision = $run.revision; result = "succeeded"
+} | ConvertTo-Json -Compress
+ttjcore --home $sampleHome call run.finish --params $request
+```
+
+### 3. JobとTaskの達成を確定し、結果を確認する
+
+Runの終了だけではJobは完了しません。ここでは管理主体が取得結果を根拠にJobを完了させます。唯一のJobが完了するとTicketも自動で`completed`になります。Taskは達成条件を確認して明示的に完了させます。
+
+```powershell
+$request = @{ id = $jobId } | ConvertTo-Json -Compress
+$job = (ttjcore --home $sampleHome call job.get --params $request | ConvertFrom-Json).result
+$request = @{
+    mode = "management"; actor = @("sample-owner"); reason = "Jobの達成条件を確認した"
+    id = $jobId; revision = $job.revision; status = "completed"; criteria_met = $true
+    result = "project.getで変更後の名前がCLIサンプル（確認済み）であることを確認した"
+} | ConvertTo-Json -Compress
+ttjcore --home $sampleHome call status.set --params $request
+
+$request = @{ id = $task.record.id } | ConvertTo-Json -Compress
+$task = (ttjcore --home $sampleHome call task.get --params $request | ConvertFrom-Json).result
+$request = @{
+    mode = "management"; actor = @("sample-owner"); reason = "Taskの達成条件を確認した"
+    id = $task.record.id; revision = $task.revision; status = "completed"; criteria_met = $true
+    result = "Projectの名前変更とコマンドでの確認が完了した"
+} | ConvertTo-Json -Compress
+ttjcore --home $sampleHome call status.set --params $request
+
+$request = @{ id = $project.record.id } | ConvertTo-Json -Compress
+$snapshot = (ttjcore --home $sampleHome call project.snapshot --params $request | ConvertFrom-Json).result
+$sampleRecords = @(
+    $snapshot.tasks[0].task.record
+    $snapshot.tasks[0].tickets[0].ticket.record
+    $snapshot.tasks[0].tickets[0].jobs[0].record
+)
+$sampleRecords | Select-Object id, status | Format-Table -AutoSize
+
+ttjcore --home $sampleHome stop
+```
+
+最後の表示でTask・Ticket・Jobがいずれも`completed`になっていることを確認できます。`stop`はサンプルのCoreだけを停止し、記録は`$sampleHome`内のSQLiteに残ります。各methodの詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+
 ## フォルダ構造
 
 Linuxの`tree`形式で、配布対象のフォルダと末端ファイルを示します。`.git`とローカルの生成物は含みません。
