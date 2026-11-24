@@ -6,7 +6,12 @@ use ttjcore::{
 };
 
 async fn change(db: &Store, method: &str, mut params: Value) -> ttjcore::Result<Value> {
-    params["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
+    if method.starts_with("run.") {
+        params["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
+    } else {
+        params["actor"] = json!(["owner"]);
+        params["mode"] = json!("management");
+    }
     if method != "task.purge" {
         params["reason"] = json!("Fixture operation");
     }
@@ -84,7 +89,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
         "sqlite://{}?mode=rwc",
         path.to_string_lossy().replace('\\', "/")
     );
-    let db = Store::connect(&url, true).await.unwrap();
+    let db = connect(&url, true).await.unwrap();
     let detail = "ARCHIVED_DETAIL_".repeat(8192);
     let create = seed(&db, &detail).await;
     finish_work(&db, &detail).await;
@@ -229,7 +234,7 @@ async fn purge_removes_descendants_summarizes_history_preserves_knowledge_and_re
 
 #[tokio::test]
 async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_names() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db, "Instructions").await;
     let task = get(&db, "task", "tsk-abcdef-1").await;
     assert_eq!(
@@ -321,4 +326,10 @@ async fn purge_requires_a_terminal_task_rejects_references_and_keeps_historical_
         get(&db, "ticket", "tkt-abcdef-2").await["record"]["depends"],
         Value::Null
     );
+}
+
+async fn connect(url: &str, initialize: bool) -> ttjcore::Result<Store> {
+    Store::connect(url, initialize)
+        .await?
+        .with_management_actors(["owner"])
 }

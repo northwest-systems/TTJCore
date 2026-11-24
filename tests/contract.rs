@@ -1,10 +1,15 @@
 use serde_json::{Value, json};
 use ttjcore::{PROTOCOL, rpc, store::Store};
 async fn db() -> Store {
-    Store::connect("sqlite::memory:", true).await.unwrap()
+    connect("sqlite::memory:", true).await.unwrap()
 }
 async fn change(db: &Store, method: &str, mut p: Value) -> ttjcore::Result<Value> {
-    p["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
+    if method.starts_with("run.") || p.get("run").is_some() {
+        p["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
+    } else {
+        p["actor"] = json!(["owner"]);
+        p["mode"] = json!("management");
+    }
     p["reason"] = json!("Contract test");
     db.call(method, p).await
 }
@@ -480,7 +485,7 @@ async fn rpc_protocol_errors_batches_and_notifications() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database"]
 async fn postgres_contract() {
-    let db = Store::connect(
+    let db = connect(
         &std::env::var("TTJCORE_TEST_POSTGRES_URL").expect("Set test database URL"),
         true,
     )
@@ -641,8 +646,8 @@ async fn concurrent_changes_with_the_same_revision_commit_only_once() {
         "sqlite://{}?mode=rwc",
         path.to_string_lossy().replace('\\', "/")
     );
-    let first = Store::connect(&url, true).await.unwrap();
-    let second = Store::connect(&url, false).await.unwrap();
+    let first = connect(&url, true).await.unwrap();
+    let second = connect(&url, false).await.unwrap();
     seed(&first).await;
     let project = get(&first, "project", "pj-abcdef-1").await;
     let left = json!({"id":"pj-abcdef-1","revision":project["revision"],"patch":{"name":"Left"}});
@@ -851,4 +856,10 @@ async fn snapshot_resolves_current_and_historical_dependencies_across_projects_a
             .iter()
             .any(|event| event["from"]["record"]["depends"] == json!(["tkt-abcdef-4"]))
     );
+}
+
+async fn connect(url: &str, initialize: bool) -> ttjcore::Result<Store> {
+    Store::connect(url, initialize)
+        .await?
+        .with_management_actors(["owner"])
 }

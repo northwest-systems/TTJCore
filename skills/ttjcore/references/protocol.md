@@ -124,7 +124,11 @@ Ticketの作成paramsの例:
 {"actor":["operator"],"reason":"作業計画を登録する","operation":"example-ticket-create","record":{"task_id":"<task-id>","worker_id":"<worker-id>","session_id":"<session-id>","objective":"案内を完成させる","jobs":[{"objective":"案内を書く","criteria":["必要事項がある"]},{"objective":"GitHubでreviewする","criteria":["review結果がある"],"display":{"icon":"github"}}]}}
 ```
 
-変更には`actor`・`reason`が必要です。`task.purge`はreasonを省略でき、削除操作として自動記録します。`operation`は省略すると生成しますが、再送するclientは事前に固有の値を指定してください。同じoperationと同じrequestの再送は、生成済みIDを含む同じ結果を返します。同じoperationで内容を変えるとconflictになります。物理削除の対象となった過去の操作は失効し、再送するとconflictになります。
+変更には`actor`・`reason`が必要です。Task・Ticket・Jobのupdateとstatus.setでは、実行由来なら`run`に現行Run IDを指定し、actorを固定の`[worker_id, session_id]`にします。省略・別Session・終了Session・現在Job以外・終了済みRunからの更新を拒否します。
+
+管理経路は`mode:"management"`を明示し、actorに許可された管理主体を1件指定します。許可主体はCore起動時の`TTJCORE_MANAGEMENT_ACTORS`（JSON string配列）で設定し、既定では管理権限を付与しません。例えばPowerShellでは`$env:TTJCORE_MANAGEMENT_ACTORS = '["operator"]'`を設定してCoreを起動します。設定変更時はCoreを再起動します。ライブラリでは`Store::with_management_actors`で同じ許可主体を設定できます。認証は規格どおり外部環境の責務で、Core profileのIPC credentialは信頼された呼び出し元だけに渡し、gatewayは認証済み主体をactorへ対応付けます。modeや任意のactor名の指定だけでは管理権限を得られません。管理経路では実行元を表す`run`を受け付けません。
+
+Taskの範囲・期限、Ticketのdepends、Sessionのendedの変更とdocument.importは管理経路を使います。Sessionの終了は取り消せず、同じSessionの一時切断・再接続ではendedを設定しません。`task.purge`はreasonを省略でき、削除操作として自動記録します。`operation`は省略すると生成しますが、再送するclientは事前に固有の値を指定してください。同じoperationと同じrequestの再送は、生成済みIDを含む同じ結果を返します。同じoperationで内容を変えるとconflictになります。物理削除の対象となった過去の操作は失効し、再送するとconflictになります。
 
 update・delete・status.set・Runの操作は直前のgetまたはsnapshotからrevisionを取得してください。conflict時は最新のrecordを読み、変更内容を判断し直します。
 
@@ -171,16 +175,22 @@ Job・Taskをcompletedにするには、status.setに`criteria_met:true`と確�
 | release:true | pausedを解除する際に指定 |
 | resolved:true | waiting・blockedの原因を解消したことを確認して指定 |
 | criteria_met:true, result | Job・Taskをcompletedにする際に指定 |
-| run | Jobの変更時にRunを指定。有効なRunとTicketの固定worker_id・session_idを検証。終了・失効したRunは使用不可 |
+| run | 実行由来のTask・Ticket・Job変更で必須。有効なRunとTicketの固定worker_id・session_idを検証。終了・失効したRunは使用不可 |
 | retry_of, safety | run.startで再試行する場合の閉じた元Runと停止・安全確認内容。Ticket内に過去Runがある開始ではsafetyが必要 |
 
 同じTicketの別Jobの同時実行、未完了のdependsを飛ばす開始、completed・canceledからの復帰を拒否します。同一Ticketで開いたRunは最大1件です。run.start・run.finish・run.waitのactorは`["<worker-id>","<session-id>"]`とし、固定された担当と一致させます。
 
 CoreはRunとDB内の更新権を管理します。外部processの起動・監視・OS上の停止は行いません。停止要求はevent・constraintsに記録されるため、実行側が実際の停止を確認して記録してください。
 
+## 終了後の外部証拠
+
+`job.accept_evidence`は実行終了後に届く承認などを取り込む専用経路です。`id, revision`は現在Job、`evidence_run, run_revision`はそのJobの閉じたRunを指します。`evidence`に待機条件・成果との照合内容を記録し、未解決waitがあれば`wait_met:true`を必須とします。`status`は`doing`・`todo`・`completed`で、completedには`criteria_met:true`と`result`も必要です。固定の適格Session（actorはworker_id/session_id）または許可された管理主体（mode=management）のみが使えます。管理経路にあるrun禁止は、この専用経路でも維持します。evidence_runは証拠の対象参照であり、旧Runによる実行権ではありません。
+
+対象Ticketがpaused・blocked・終端、親Taskがpaused・終端、現在Jobがwaiting/doing以外、または有効Runが残る場合は取り込みを拒否します。照合済みのRun.wait.resolvedとJobの待機解除・完了、Ticketの集約、監査記録を同じtransactionで確定します。どのガードに失敗しても一切変更しません。Runのresult・endedは変更せず、終了済みRunの一般更新も引き続き拒否します。解決したwaitは依存グラフから外し、正式な履歴として保持します。
+
 ## TTJファイルの入出力
 
-`document.export`はoptionalの`project`（Project ID）または`tickets`（Ticket ID配列）で絞り、規格の5キーだけを持つTTJ文書を返します。単一Projectとルートtickets、その担当Worker/Sessionを含めます。`document.import`には`actor, reason, documents`を指定し、documentsにTTJ文書の配列を渡します。分割ファイルを結合して検証し、全レコードと履歴を一括保存します。既存の同一Worker/Sessionは共有でき、ほかの既存IDの上書きは拒否します。Ticketファイルだけを追加する場合は対応Task・Worker・Sessionを先に登録してください。
+`document.export`はoptionalの`project`（Project ID）または`tickets`（Ticket ID配列）で絞り、規格の5キーだけを持つTTJ文書を返します。単一Projectとルートtickets、その担当Worker/Sessionを含めます。`document.import`には`mode:"management", actor, reason, documents`を指定し、documentsにTTJ文書の配列を渡します。分割ファイルを結合して検証し、全レコードと履歴を一括保存します。既存の同一Worker/Sessionは共有でき、ほかの既存IDの上書きは拒否します。Ticketファイルだけを追加する場合は対応Task・Worker・Sessionを先に登録してください。
 
 ```sh
 ttjcore export <project-id> --file combined.json
@@ -188,9 +198,13 @@ ttjcore export <project-id> --directory exported
 ttjcore import --file exported/project.json --file exported/tickets/<ticket-id>.json --actor '["operator"]' --reason 'Import verified records'
 ```
 
-分割時は`project.json`と`tickets/<ticket-id>.json`を出力します。空配列は省略し、読み込み時は空配列へ戻します。Task.project・Task.tickets・Runの逆参照を出力しません。`project.snapshot`はUI用のwrapper・timeline・依存先を含む参照APIで、ファイル保存にはdocument.exportを使います。1.0.0のDBとJSONは自動変換せず、異なるprotocolとして拒否します。
+分割時は`project.json`と`tickets/<ticket-id>.json`を出力します。出力先は空のディレクトリに限り、非空の出力先・同時書き込みを拒否するため、既存Ticketファイルと新しいスナップショットを混在させません。exportは単一のDBスナップショットを読みます。論理削除済み・別Project・選択外など、文書に含まれない完了依存先を持つ場合は明示的に拒否します。
 
-`run.wait`のparamsは`actor, reason, id, revision, wait`です。waitは単一オブジェクトで、更新で省略した内部フィールドは維持し、target・condition・since・resume_point・timeout・resolvedを保持します。別Ticketの完了待ちはtargetにTicket IDを指定します。未解決の待機はpaused・blocked中もdependsと同じグラフで循環検証し、resolved日時のある待機は履歴に残して循環辺から除きます。待機解除後にRunを終了する場合は、終了前にresolvedを記録してください。Run終了後の更新は拒否します。
+Job内のRun.waitはpaused中も保存し、importで未解決待機ガードを復元します。pausedの背後に隠れたTask待機・障害など、規格の5キーと既存フィールドでは復元不能なガードがある場合、exportは情報を落とした成功を返さず拒否します。元データ側で保持中の制約を解消するか、復元可能な状態へ戻してから再度exportします。新たな制御フィールドをTTJ JSONへ追加しません。
+
+未終了Runのimportでは、現在Jobへの所属・全先行Jobの終端・dependsの全完了・適格な固定Sessionを検証します。paused/waiting/blockedの既存試行の復元は許可しますが、そのまま新しい実行を開始することはできません。再開時には残存ガードと安全確認を評価します。空配列は省略し、読み込み時は空配列へ戻します。Task.project・Task.tickets・Runの逆参照を出力しません。`project.snapshot`はUI用のwrapper・timeline・依存先を含む参照APIで、ファイル保存にはdocument.exportを使います。1.0.0のDBとJSONは自動変換せず、異なるprotocolとして拒否します。
+
+`run.wait`のparamsは`actor, reason, id, revision, wait`です。waitは単一オブジェクトで、更新で省略した内部フィールドは維持し、target・condition・since・resume_point・timeout・resolvedを保持します。別Ticketの完了待ちはtargetにTicket IDを指定します。未解決の待機はpaused・blocked中もdependsと同じグラフで循環検証し、resolved日時のある待機は履歴に残して循環辺から除きます。待機解除前にRunが終了した場合はjob.accept_evidenceで確認可能な応答を取り込みます。終了済みRunをrun.waitや実行元run指定で直接更新することはできません。
 
 Ticket中止ではstatus.setにcancel_reasonが必須です。Task中止では理由を子Ticketのcancel_reasonとして記録します。中止は未終端の子孫へ反映し、有効Runにresult=canceledを記録して閉じ、停止要求を残します。後続の開始には実行側による停止・安全確認が必要です。
 
@@ -218,7 +232,7 @@ optionalのprojectで絞り込めます。cursor省略時は現在位置から�
 
 eventはcommit済みの履歴を参照します。同じoperationの再送では新しいeventを作りません。切断後は最後に受け取ったcursorから再接続します。Herdr Modはevents.waitを使い、変更があったときにsnapshotを更新します。
 
-eventの種類は`record.created`・`record.updated`・`record.deleted`・`status.changed`・`record.imported`・`run.wait_changed`・`run.started`・`run.finished`・`execution.stop_requested`・`knowledge.superseded`です。eventは変更の概要なので、詳細はgetまたはsnapshotで取得します。Runへのexecution.stop_requestedを受けた場合は、run.getのconstraintsにあるstop_requestedを確認し、実行側で停止に対応してください。
+eventの種類は`record.created`・`record.updated`・`record.deleted`・`status.changed`・`record.imported`・`run.wait_resolved`・`evidence.accepted`・`run.wait_changed`・`run.started`・`run.finished`・`execution.stop_requested`・`knowledge.superseded`です。eventは変更の概要なので、詳細はgetまたはsnapshotで取得します。Runへのexecution.stop_requestedを受けた場合は、run.getのconstraintsにあるstop_requestedを確認し、実行側で停止に対応してください。
 
 実行するagentはrun.start・run.finish・status.setで状態を記録します。CoreはCodex・Claude Codeのprocessを自動で検出・操作しません。
 
@@ -227,7 +241,7 @@ eventの種類は`record.created`・`record.updated`・`record.deleted`・`statu
 create・updateのトップレベルにdisplayを指定できます。summaryはカードの概要、iconは任意のicon keyです。ticket.createの各Job定義にもdisplay.iconを指定できます。TTJのrecord本体から分離して保存し、wrapperのdisplayと履歴に返します。
 
 ```json
-{"actor":["operator"],"reason":"summaryを更新する","operation":"example-display-update","id":"<ticket-id>","revision":1,"patch":{},"display":{"summary":"案内を確認する"}}
+{"mode":"management","actor":["operator"],"reason":"summaryを更新する","operation":"example-display-update","id":"<ticket-id>","revision":1,"patch":{},"display":{"summary":"案内を確認する"}}
 ```
 
 ## Error

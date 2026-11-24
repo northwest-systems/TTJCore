@@ -15,6 +15,9 @@ async fn change(db: &Store, method: &str, mut p: Value) -> ttjcore::Result<Value
     } else {
         json!(["owner"])
     };
+    if !method.starts_with("run.") && p.get("run").is_none() {
+        p["mode"] = json!("management");
+    }
     p["reason"] = json!("Verified operation");
     db.call(method, p).await.map(|v| v["value"].clone())
 }
@@ -90,7 +93,7 @@ async fn files_and_store_round_trip_formal_records_after_handoff_loss_and_restar
         "sqlite://{}?mode=rwc",
         database.to_string_lossy().replace('\\', "/")
     );
-    let db = Store::connect(&url, true).await.unwrap();
+    let db = connect(&url, true).await.unwrap();
     seed(&db).await;
     start(&db, JOB, RUN).await.unwrap();
     wait(&db,RUN,json!({"target":"external review","condition":"Approved","since":"2026-01-01T00:00:00Z","resume_point":"Verify review","timeout":"2026-01-02T00:00:00Z"})).await.unwrap();
@@ -103,7 +106,7 @@ async fn files_and_store_round_trip_formal_records_after_handoff_loss_and_restar
     .await
     .unwrap();
     db.db.close().await.unwrap();
-    let db = Store::connect(&url, false).await.unwrap();
+    let db = connect(&url, false).await.unwrap();
     let value = db
         .call("document.export", json!({"project":PROJECT}))
         .await
@@ -128,7 +131,7 @@ async fn files_and_store_round_trip_formal_records_after_handoff_loss_and_restar
         .map(|path| Document::read(path).unwrap())
         .collect();
     assert_eq!(Document::merge(files.clone()).unwrap(), document);
-    let other = Store::connect("sqlite::memory:", true).await.unwrap();
+    let other = connect("sqlite::memory:", true).await.unwrap();
     for file in files {
         change(
             &other,
@@ -164,7 +167,7 @@ async fn files_and_store_round_trip_formal_records_after_handoff_loss_and_restar
 
 #[tokio::test]
 async fn handoff_is_single_volatile_slot_and_job_result_is_independent() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db).await;
     start(&db, JOB, RUN).await.unwrap();
     let run = get(&db, "run", RUN).await;
@@ -227,7 +230,7 @@ async fn handoff_is_single_volatile_slot_and_job_result_is_independent() {
 
 #[tokio::test]
 async fn mixed_wait_dependencies_remain_acyclic_when_paused_or_blocked() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db).await;
     change(&db, "ticket.create", ticket("tkt-ABC123-2", "job-ABC123-2"))
         .await
@@ -266,7 +269,7 @@ async fn mixed_wait_dependencies_remain_acyclic_when_paused_or_blocked() {
 
 #[tokio::test]
 async fn cancellation_closes_runs_preserves_reason_and_new_ticket_references_old() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db).await;
     start(&db, JOB, RUN).await.unwrap();
     assert!(
@@ -321,7 +324,7 @@ async fn cancellation_closes_runs_preserves_reason_and_new_ticket_references_old
 
 #[tokio::test]
 async fn import_is_atomic_and_forbidden_fields_do_not_enter_storage() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db).await;
     let invalid = json!({"protocol":PROTOCOL,"workers":[{"id":"wkr-ABC123-2","name":"New"}],"project":{"id":PROJECT,"name":"Conflict"}});
     assert!(
@@ -359,7 +362,7 @@ async fn import_is_atomic_and_forbidden_fields_do_not_enter_storage() {
     .await
     .unwrap();
     // A fresh database isolates the selected ID series from the seed series.
-    let separate = Store::connect("sqlite::memory:", true).await.unwrap();
+    let separate = connect("sqlite::memory:", true).await.unwrap();
     change(
         &separate,
         "worker.create",
@@ -393,7 +396,7 @@ async fn import_is_atomic_and_forbidden_fields_do_not_enter_storage() {
 
 #[tokio::test]
 async fn generated_sequences_cover_all_seven_kinds_and_survive_purge() {
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     let worker = change(&db, "worker.create", json!({"record":{"name":"First"}}))
         .await
         .unwrap();
@@ -523,8 +526,8 @@ async fn concurrent_reverse_waits_cannot_both_commit_and_static_edges_also_count
         "sqlite://{}?mode=rwc",
         path.to_string_lossy().replace('\\', "/")
     );
-    let db = Store::connect(&url, true).await.unwrap();
-    let other = Store::connect(&url, false).await.unwrap();
+    let db = connect(&url, true).await.unwrap();
+    let other = connect(&url, false).await.unwrap();
     seed(&db).await;
     change(&db, "ticket.create", ticket("tkt-ABC123-2", "job-ABC123-2"))
         .await
@@ -539,7 +542,7 @@ async fn concurrent_reverse_waits_cannot_both_commit_and_static_edges_also_count
     db.db.close().await.unwrap();
     other.db.close().await.unwrap();
     std::fs::remove_file(path).unwrap();
-    let db = Store::connect("sqlite::memory:", true).await.unwrap();
+    let db = connect("sqlite::memory:", true).await.unwrap();
     seed(&db).await;
     let mut second = ticket("tkt-ABC123-2", "job-ABC123-2");
     second["record"]["depends"] = json!([TICKET]);
@@ -556,4 +559,10 @@ async fn concurrent_reverse_waits_cannot_both_commit_and_static_edges_also_count
         .unwrap();
     value["tickets"][0]["jobs"][0]["runs"][0]["wait"] = json!({"target":"tkt-ABC123-2"});
     assert!(Document::parse(&value).is_err());
+}
+
+async fn connect(url: &str, initialize: bool) -> ttjcore::Result<Store> {
+    Store::connect(url, initialize)
+        .await?
+        .with_management_actors(["owner"])
 }

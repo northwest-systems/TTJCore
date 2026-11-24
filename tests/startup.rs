@@ -14,6 +14,7 @@ impl Profile {
             .arg(&self.0)
             .args(args)
             .env_remove("TTJCORE_DATABASE_URL")
+            .env("TTJCORE_MANAGEMENT_ACTORS", r#"["owner"]"#)
             .output()
             .unwrap();
         eprintln!("CLI {} exited", args[0]);

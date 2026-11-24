@@ -66,6 +66,7 @@ pub struct Engine {
     pub reserved_ids: BTreeSet<String>,
     pub changes: Vec<Change>,
     pub actor: Vec<String>,
+    pub management_actors: BTreeSet<String>,
     pub reason: String,
     pub now: String,
 }
@@ -547,7 +548,39 @@ impl Engine {
                 "Execution requires the Ticket's worker_id and session_id as actor",
             ));
         }
-        self.check_session(&ticket.body)
+        self.check_session(&ticket.body)?;
+        if self
+            .get(&text(&ticket.body, "session_id")?)?
+            .body
+            .get("ended")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(rule("The Ticket Session has ended"));
+        }
+        Ok(())
+    }
+    fn authorize_management(&self, p: &Value) -> Result<()> {
+        if p["mode"] != "management"
+            || p.get("run").is_some()
+            || self.actor.len() != 1
+            || !self.management_actors.contains(&self.actor[0])
+        {
+            return Err(rule(
+                "Management requires mode=management and a configured authorized principal; execution Run identity is not accepted",
+            ));
+        }
+        Ok(())
+    }
+    fn authorize_change(&self, p: &Value, target: &record::Model) -> Result<()> {
+        match p.get("mode").and_then(Value::as_str) {
+            Some("management") => self.authorize_management(p),
+            None | Some("execution") => self.authorize_run(
+                p.get("run")
+                    .ok_or_else(|| rule("Execution changes require a current Run ID"))?,
+                target,
+            ),
+            _ => Err(invalid("mode must be execution or management")),
+        }
     }
     pub fn update(&mut self, kind: &str, p: &Value) -> Result<Value> {
         let mut row = self.expect(p)?;
@@ -566,6 +599,18 @@ impl Engine {
             _ => return Err(rule("Runs are updated through run.finish")),
         };
         Self::allowed(patch, allowed)?;
+        if kind == "session" {
+            self.authorize_management(p)?;
+            if row.body["ended"].is_string()
+                && patch
+                    .get("ended")
+                    .is_some_and(|ended| *ended != row.body["ended"])
+            {
+                return Err(rule(
+                    "An ended Session cannot be reopened or have its end changed",
+                ));
+            }
+        }
         if terminal(&row.body) {
             return Err(rule("Terminal records cannot be changed"));
         }
@@ -587,8 +632,15 @@ impl Engine {
                 row.flags["display"][key] = value.clone();
             }
         }
-        if let Some(run) = p.get("run") {
-            self.authorize_run(run, &row)?;
+        if (kind == "task"
+            && ["objective", "criteria", "deadline"]
+                .iter()
+                .any(|field| patch.get(field).is_some()))
+            || (kind == "ticket" && patch.get("depends").is_some())
+        {
+            self.authorize_management(p)?;
+        } else if matches!(kind, "task" | "ticket" | "job") {
+            self.authorize_change(p, &row)?;
         }
         for (key, value) in patch.as_object().unwrap() {
             if value.is_null()
@@ -738,12 +790,14 @@ impl Engine {
         Ok(json!({"id":row.id,"deleted":true,"physical":true,"records":ids.len()}))
     }
     pub fn set_status(&mut self, p: &Value) -> Result<Value> {
+        let row = self.expect(p)?;
+        self.authorize_change(p, &row)?;
+        self.set_status_inner(p)
+    }
+    fn set_status_inner(&mut self, p: &Value) -> Result<Value> {
         let mut row = self.expect(p)?;
         if !matches!(row.kind.as_str(), "task" | "ticket" | "job") {
             return Err(rule("This record has no work status"));
-        }
-        if let Some(run) = p.get("run") {
-            self.authorize_run(run, &row)?;
         }
         let target = text(p, "status")?;
         let source = text(&row.body, "status")?;
@@ -788,7 +842,10 @@ impl Engine {
                 if (target == "todo") == row.started {
                     return Err(rule("Use doing for started work, todo for unstarted work"));
                 }
-                if row.flags["blocked"] == true || row.flags["waiting"] == true {
+                if row.flags["blocked"] == true
+                    || row.flags["waiting"] == true
+                    || self.pending_wait(&row)
+                {
                     return Err(rule("Unresolved constraints remain"));
                 }
                 if row.kind == "job" {
@@ -813,7 +870,15 @@ impl Engine {
                 if row.flags["blocked"] == true {
                     return Err(rule("Resolve blocking issues before waiting"));
                 }
-                row.flags["waiting"] = json!(true);
+                let derived = row.kind == "ticket"
+                    && (!self.dependencies(&row)?.0
+                        || self.current(&row)?.is_some_and(|job| {
+                            matches!(job.body["status"].as_str(), Some("waiting" | "paused"))
+                                || self.pending_wait(&job)
+                        }));
+                if !derived {
+                    row.flags["waiting"] = json!(true);
+                }
             }
             "blocked" => {
                 row.flags["blocked"] = json!(true);
@@ -836,7 +901,10 @@ impl Engine {
                     } else {
                         row.flags["completion_evidence"] = json!(result);
                     }
-                    if row.flags["waiting"] == true || row.flags["blocked"] == true {
+                    if row.flags["waiting"] == true
+                        || row.flags["blocked"] == true
+                        || self.pending_wait(&row)
+                    {
                         return Err(rule("Resolve constraints before completing"));
                     }
                     if row.kind == "job" {
@@ -919,6 +987,9 @@ impl Engine {
         Ok(())
     }
     fn startable(&self, job: &record::Model) -> Result<()> {
+        if job.flags["waiting"] == true || job.flags["blocked"] == true || self.pending_wait(job) {
+            return Err(rule("Job has unresolved resume constraints"));
+        }
         let ticket = self.parent(job)?;
         let task = self.parent(&ticket)?;
         if matches!(
@@ -1040,7 +1111,13 @@ impl Engine {
         {
             return Err(rule("Run does not belong to target"));
         }
-        if terminal(&job.body) || terminal(&ticket.body) {
+        if terminal(&job.body)
+            || terminal(&ticket.body)
+            || terminal(&task.body)
+            || self
+                .current(&ticket)?
+                .is_none_or(|current| current.id != job.id)
+        {
             return Err(rule("Run authority has expired"));
         }
         self.authorize(&ticket)
@@ -1060,10 +1137,108 @@ impl Engine {
         }
         Self::validate("run", &run.body)?;
         let id = run.id.clone();
+        let job_id = run.parent.clone().unwrap();
         self.save(run, "run.wait_changed")?;
+        let mut job = self.get(&job_id)?;
+        let pending = self.pending_wait(&job);
+        job.flags["waiting"] = json!(pending);
+        if pending && matches!(job.body["status"].as_str(), Some("todo" | "doing")) {
+            job.body["status"] = json!("waiting");
+        }
+        self.save(job, "status.changed")?;
         self.check_cycles()?;
         self.reconcile()?;
         Ok(self.record_view(&self.get(&id)?))
+    }
+    fn pending_wait(&self, row: &record::Model) -> bool {
+        let job = if row.kind == "job" {
+            Some(row.clone())
+        } else if row.kind == "ticket" {
+            self.current(row).ok().flatten()
+        } else {
+            None
+        };
+        job.is_some_and(|job| {
+            self.children(&job.id).iter().any(|run| {
+                run.kind == "run"
+                    && run.body["wait"].is_object()
+                    && run.body["wait"]["resolved"].is_null()
+            })
+        })
+    }
+    pub fn accept_evidence(&mut self, p: &Value) -> Result<Value> {
+        if p.get("run").is_some() {
+            return Err(rule(
+                "Evidence must not originate from an expired execution Run",
+            ));
+        }
+        let job = self.expect(p)?;
+        if job.kind != "job" || !matches!(job.body["status"].as_str(), Some("waiting" | "doing")) {
+            return Err(rule("Evidence requires the current waiting/doing Job"));
+        }
+        let ticket = self.parent(&job)?;
+        let task = self.parent(&ticket)?;
+        if terminal(&ticket.body)
+            || matches!(ticket.body["status"].as_str(), Some("paused" | "blocked"))
+            || terminal(&task.body)
+            || task.body["status"] == "paused"
+            || self
+                .current(&ticket)?
+                .is_none_or(|current| current.id != job.id)
+        {
+            return Err(rule(
+                "Ticket/Task constraints prevent evidence-driven advancement",
+            ));
+        }
+        match p.get("mode").and_then(Value::as_str) {
+            Some("management") => self.authorize_management(p)?,
+            None | Some("session") => self.authorize(&ticket)?,
+            _ => return Err(invalid("Evidence mode must be session or management")),
+        }
+        let evidence = text(p, "evidence")?;
+        let mut run = self.get(&text(p, "evidence_run")?)?;
+        if run.kind != "run"
+            || run.parent.as_deref() != Some(job.id.as_str())
+            || run.active
+            || run.body.get("result").is_none()
+            || self
+                .descendants(&ticket.id)
+                .iter()
+                .any(|row| row.kind == "run" && row.active)
+        {
+            return Err(rule(
+                "Evidence requires a closed Run belonging to the current Job, with no active attempt",
+            ));
+        }
+        if p["run_revision"].as_i64() != Some(run.revision) {
+            return Err(conflict());
+        }
+        if run.body["wait"].is_object() && run.body["wait"]["resolved"].is_null() {
+            if p["wait_met"] != true {
+                return Err(rule(
+                    "Wait resolution requires verified wait_met=true evidence",
+                ));
+            }
+            run.body["wait"]["resolved"] = json!(self.now);
+            run.flags["wait_evidence"] = json!(evidence);
+            Self::validate("run", &run.body)?;
+            self.save(run.clone(), "run.wait_resolved")?;
+        }
+        let status = text(p, "status")?;
+        if !matches!(status.as_str(), "completed" | "doing" | "todo") {
+            return Err(invalid("Evidence status must be completed, doing or todo"));
+        }
+        let mut transition = p.clone();
+        transition["resolved"] = json!(true);
+        let mut job = self.get(&job.id)?;
+        job.flags["evidence"] = json!({"source_run":run.id,"verification":evidence});
+        self.save(job.clone(), "evidence.accepted")?;
+        transition["revision"] = json!(self.get(&job.id)?.revision);
+        let result = self.set_status_inner(&transition)?;
+        self.check_cycles()?;
+        Ok(
+            json!({"job":result,"run":self.record_view(&self.get(&run.id)?),"ticket":self.record_view(&self.get(&ticket.id)?)}),
+        )
     }
     fn reconcile(&mut self) -> Result<()> {
         let ids: Vec<_> = self
@@ -1122,6 +1297,75 @@ impl Engine {
         }
         Err(rule("Unable to reconcile dependency states"))
     }
+    fn restored_guards(
+        &self,
+        row: &record::Model,
+        included: &BTreeSet<String>,
+    ) -> Result<(bool, bool, bool)> {
+        let started = matches!(row.body["status"].as_str(), Some("doing" | "completed"))
+            || self
+                .descendants(&row.id)
+                .iter()
+                .any(|r| r.kind == "run" && included.contains(&r.id));
+        let (waiting, blocked) = if row.kind == "ticket" {
+            let (ready, dependency_blocked) = self.dependencies(row)?;
+            let current = self.current(row)?;
+            (
+                row.body["status"] == "waiting"
+                    && ready
+                    && !current.as_ref().is_some_and(|job| {
+                        matches!(job.body["status"].as_str(), Some("waiting" | "paused"))
+                            || self.pending_wait(job)
+                    }),
+                row.body["status"] == "blocked"
+                    && !dependency_blocked
+                    && !current
+                        .as_ref()
+                        .is_some_and(|job| job.body["status"] == "blocked"),
+            )
+        } else {
+            (
+                row.body["status"] == "waiting" || (row.kind == "job" && self.pending_wait(row)),
+                row.body["status"] == "blocked",
+            )
+        };
+        Ok((started, waiting, blocked))
+    }
+    fn validate_open_run(&self, run: &record::Model) -> Result<()> {
+        let job = self.parent(run)?;
+        let ticket = self.parent(&job)?;
+        let task = self.parent(&ticket)?;
+        if job.kind != "job"
+            || ticket.kind != "ticket"
+            || task.kind != "task"
+            || terminal(&job.body)
+            || terminal(&ticket.body)
+            || terminal(&task.body)
+            || job.body["status"] == "todo"
+            || ticket.body["status"] == "todo"
+            || task.body["status"] == "todo"
+            || self
+                .current(&ticket)?
+                .is_none_or(|current| current.id != job.id)
+        {
+            return Err(rule(
+                "An open Run must belong to the current non-terminal Job",
+            ));
+        }
+        self.check_session(&ticket.body)?;
+        if self.get(&text(&ticket.body, "session_id")?)?.body["ended"].is_string() {
+            return Err(rule("An open Run cannot be restored into an ended Session"));
+        }
+        for id in strings(&ticket.body, "depends", false)? {
+            let dependency = self.raw(&id)?;
+            if dependency.kind != "ticket" || dependency.body["status"] != "completed" {
+                return Err(rule(
+                    "Open Run restoration requires completed prerequisite Tickets",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn export(&self, p: &Value) -> Result<Document> {
         let mut value = json!({"protocol": crate::PROTOCOL});
         let project = p.get("project").map(|_| text(p, "project")).transpose()?;
@@ -1134,6 +1378,7 @@ impl Engine {
         }
         let tickets = strings(p, "tickets", false)?;
         let mut bodies = vec![];
+        let mut included = BTreeSet::new();
         let mut workers = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         for row in self
@@ -1150,6 +1395,13 @@ impl Engine {
             if !tickets.is_empty() && !tickets.contains(&row.id) {
                 continue;
             }
+            included.insert(row.id.clone());
+            included.extend(
+                self.descendants(&row.id)
+                    .iter()
+                    .filter(|r| !r.deleted)
+                    .map(|r| r.id.clone()),
+            );
             workers.insert(text(&row.body, "worker_id")?);
             sessions.insert(text(&row.body, "session_id")?);
             bodies.push(self.record_body(row));
@@ -1157,6 +1409,43 @@ impl Engine {
         for id in &tickets {
             if self.get(id)?.kind != "ticket" {
                 return Err(invalid("tickets must identify Tickets"));
+            }
+        }
+        if let Some(project) = &project {
+            included.insert(project.clone());
+            included.extend(
+                self.children(project)
+                    .iter()
+                    .filter(|r| !r.deleted && matches!(r.kind.as_str(), "task" | "knowledge"))
+                    .map(|r| r.id.clone()),
+            );
+        }
+        for id in &included {
+            let row = self.get(id)?;
+            if row.kind == "ticket" {
+                let dependencies = strings(&row.body, "depends", false)?;
+                for dependency in dependencies.into_iter().chain(self.edges(&row)?) {
+                    if !included.contains(&dependency) || self.raw(&dependency)?.deleted {
+                        return Err(rule(
+                            "Export requires all completion dependencies, including deleted prerequisites, to be retained in the document",
+                        ));
+                    }
+                }
+            }
+            if matches!(row.kind.as_str(), "task" | "ticket" | "job") && !terminal(&row.body) {
+                let (started, waiting, blocked) = self.restored_guards(&row, &included)?;
+                if row.started != started
+                    || (row.flags["waiting"] == true) != waiting
+                    || (row.flags["blocked"] == true) != blocked
+                {
+                    return Err(rule(format!(
+                        "Cannot export {} without losing its resume guards; resolve the hidden constraints or restore a representable state first",
+                        row.id
+                    )));
+                }
+            }
+            if row.kind == "run" && row.active {
+                self.validate_open_run(&row)?;
             }
         }
         value["tickets"] = json!(bodies);
@@ -1287,44 +1576,50 @@ impl Engine {
             self.save(row, "record.imported")?;
             count += 1;
         }
-        let imported: Vec<_> = self
+        let included: BTreeSet<_> = self.rows.keys().cloned().collect();
+        let work: Vec<_> = self
+            .changes
+            .iter()
+            .filter(|change| {
+                change.event == "record.created"
+                    && matches!(change.row.kind.as_str(), "task" | "ticket" | "job")
+            })
+            .map(|change| change.row.id.clone())
+            .collect();
+        for id in work {
+            let mut row = self.get(&id)?;
+            let (started, waiting, blocked) = self.restored_guards(&row, &included)?;
+            row.started = started;
+            row.flags["waiting"] = json!(waiting);
+            row.flags["blocked"] = json!(blocked);
+            self.save(row, "record.imported")?;
+        }
+        let ancestors: Vec<_> = self
             .rows
             .values()
-            .filter(|r| !r.deleted && matches!(r.kind.as_str(), "task" | "ticket" | "job"))
+            .filter(|row| {
+                !row.deleted
+                    && matches!(row.kind.as_str(), "task" | "ticket" | "job")
+                    && !row.started
+            })
             .cloned()
             .collect();
-        for mut row in imported {
-            if !row.started && self.descendants(&row.id).iter().any(|r| r.kind == "run") {
+        for mut row in ancestors {
+            if self
+                .descendants(&row.id)
+                .iter()
+                .any(|child| child.kind == "run")
+            {
                 row.started = true;
                 self.save(row, "record.imported")?;
             }
         }
-        let imported_tickets: Vec<_> = self
-            .changes
-            .iter()
-            .filter(|change| change.event == "record.created" && change.row.kind == "ticket")
-            .map(|change| change.row.id.clone())
-            .collect();
-        for id in imported_tickets {
-            let mut row = self.get(&id)?;
-            let (ready, blocked) = self.dependencies(&row)?;
-            let current = self.current(&row)?;
-            row.flags["blocked"] = json!(
-                row.body["status"] == "blocked"
-                    && !blocked
-                    && !current
-                        .as_ref()
-                        .is_some_and(|job| job.body["status"] == "blocked")
-            );
-            row.flags["waiting"] = json!(
-                row.body["status"] == "waiting"
-                    && ready
-                    && !current.as_ref().is_some_and(|job| matches!(
-                        job.body["status"].as_str(),
-                        Some("waiting" | "paused")
-                    ))
-            );
-            self.save(row, "record.imported")?;
+        for run in self
+            .rows
+            .values()
+            .filter(|row| row.kind == "run" && row.active && !row.deleted)
+        {
+            self.validate_open_run(run)?;
         }
         for ticket in self
             .rows
@@ -1345,7 +1640,11 @@ impl Engine {
     }
     pub fn apply(&mut self, method: &str, p: &Value) -> Result<Value> {
         match method {
-            "document.import" => self.import(p),
+            "document.import" => {
+                self.authorize_management(p)?;
+                self.import(p)
+            }
+            "job.accept_evidence" => self.accept_evidence(p),
             "task.purge" => self.purge_task(p),
             "status.set" => self.set_status(p),
             "run.start" => self.start_run(p),

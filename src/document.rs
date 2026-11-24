@@ -495,16 +495,42 @@ impl Document {
         directory: impl AsRef<std::path::Path>,
     ) -> Result<Vec<std::path::PathBuf>> {
         self.validate()?;
-        let mut paths = vec![];
-        for (name, document) in self.split() {
-            let path = directory.as_ref().join(name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| fail("Cannot create TTJ directory"))?;
+        let directory = directory.as_ref();
+        std::fs::create_dir_all(directory).map_err(|_| fail("Cannot create TTJ directory"))?;
+        let lock_path = directory.join(".ttjcore-export.lock");
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|_| fail("Split output directory is already in use"))?;
+        let result = (|| {
+            for entry in
+                std::fs::read_dir(directory).map_err(|_| fail("Cannot inspect TTJ directory"))?
+            {
+                if entry
+                    .map_err(|_| fail("Cannot inspect TTJ directory"))?
+                    .path()
+                    != lock_path
+                {
+                    return Err(fail("Split output directory must be empty"));
+                }
             }
-            document.write(&path)?;
-            paths.push(path);
-        }
-        Ok(paths)
+            let mut paths = vec![];
+            for (name, document) in self.split() {
+                let path = directory.join(name);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| fail("Cannot create TTJ directory"))?;
+                }
+                document.write(&path)?;
+                paths.push(path);
+            }
+            Ok(paths)
+        })();
+        drop(lock);
+        let cleanup = std::fs::remove_file(lock_path)
+            .map_err(|_| fail("Cannot release split output directory"));
+        result.and_then(|paths| cleanup.map(|()| paths))
     }
     pub fn new() -> Self {
         Self {

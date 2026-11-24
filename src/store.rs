@@ -18,6 +18,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub struct Store {
     pub db: DatabaseConnection,
     changes: tokio::sync::broadcast::Sender<i64>,
+    management_actors: BTreeSet<String>,
 }
 impl Store {
     pub async fn connect(url: &str, initialize: bool) -> Result<Self> {
@@ -58,7 +59,31 @@ impl Store {
             return Err(rule("Unsupported database protocol"));
         }
         let (changes, _) = tokio::sync::broadcast::channel(64);
-        Ok(Self { db, changes })
+        let actors: Vec<String> = match std::env::var("TTJCORE_MANAGEMENT_ACTORS") {
+            Ok(value) => serde_json::from_str(&value)
+                .map_err(|_| invalid("TTJCORE_MANAGEMENT_ACTORS must be a JSON string array"))?,
+            Err(std::env::VarError::NotPresent) => vec![],
+            Err(_) => return Err(invalid("Invalid TTJCORE_MANAGEMENT_ACTORS")),
+        };
+        Self {
+            db,
+            changes,
+            management_actors: BTreeSet::new(),
+        }
+        .with_management_actors(actors)
+    }
+    /// Grants management operations to externally authenticated audit principals.
+    /// A server must configure these principals; no manager is granted by default.
+    pub fn with_management_actors(
+        mut self,
+        actors: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self> {
+        let actors: BTreeSet<String> = actors.into_iter().map(Into::into).collect();
+        if actors.iter().any(|actor| actor.trim().is_empty()) {
+            return Err(invalid("Management principals must be non-empty"));
+        }
+        self.management_actors = actors;
+        Ok(self)
     }
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         if !params.is_object() {
@@ -149,6 +174,7 @@ impl Store {
             reserved_ids,
             changes: vec![],
             actor: actor.clone(),
+            management_actors: self.management_actors.clone(),
             reason: reason.clone(),
             now: now.clone(),
         };
@@ -387,7 +413,7 @@ fn is_mutation(method: &str) -> bool {
     }
     if matches!(
         method,
-        "status.set" | "run.start" | "run.finish" | "run.wait"
+        "status.set" | "run.start" | "run.finish" | "run.wait" | "job.accept_evidence"
     ) {
         return true;
     }
@@ -413,6 +439,7 @@ fn read(
         reserved_ids: BTreeSet::new(),
         changes: vec![],
         actor: vec![],
+        management_actors: BTreeSet::new(),
         reason: String::new(),
         now: String::new(),
     };
@@ -605,6 +632,7 @@ pub fn discover() -> Value {
         }
     }
     methods.extend([
+        json!({"name":"job.accept_evidence","mutates":true,"required":["actor","reason","id","revision","evidence_run","run_revision","evidence","status"]}),
         json!({"name":"document.export","mutates":false,"required":[],"optional":["project","tickets"]}),
         json!({"name":"document.import","mutates":true,"required":["actor","reason","documents"]}),
         json!({"name":"run.wait","mutates":true,"required":["actor","reason","id","revision","wait"]}),
@@ -649,6 +677,7 @@ pub fn discover() -> Value {
             "fields":{"summary":"Short string for cards","icon":"User-defined icon key"},
             "write":"Optional display object on create/update; inline Job definitions may include display"},
         "mutation_options":{
+        "mode":"execution (default, requires current run) or management (requires an externally configured management principal)",
         "operation":"Caller-generated unique id for safe retries; generated when omitted",
         "revision":"Revision returned by the latest read; required for updates/deletes",
         "criteria_met":"Required true, with result evidence, for Task/Job completion",

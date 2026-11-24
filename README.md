@@ -115,6 +115,8 @@ ttjcore ensure
 
 passwordはURL encodeし、認証・TLS設定に応じた接続optionを指定します。接続情報をGitへ保存しないでください。すでに起動中のCoreは設定変更で切り替わりません。同じprofileのCoreをstopしてからensureしてください。initはschema作成、serveはforeground起動として引き続き使用でき、serveはCtrl+Cでも停止できます。
 
+管理操作には、起動時に`TTJCORE_MANAGEMENT_ACTORS`へ許可主体のJSON配列（例：`["operator"]`）を設定し、requestに`mode:"management"`と対応actorを明示します。既定では管理主体を許可しません。実行由来の更新は固定Worker/Sessionと現行Runに結び付けます。詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+
 DB設定はensure・init・serveが使います。call・rpc・Herdrは同じprofileのCoreに接続し、DBへ直接接続しません。
 
 ## API・LLMからの利用

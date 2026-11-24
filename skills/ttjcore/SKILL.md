@@ -11,7 +11,7 @@ Coreの利用契約は[protocol](references/protocol.md)を読む。接続・met
 
 Coreへ直接接続する。標準接続では`ttjcore ensure`で準備し、custom profileでは全コマンドに同じ`--home <data-dir>`を指定する。`project.list`から対象Projectを選び、`project.snapshot`でTask・Ticket・Job・Knowledgeとtimelineを取得する。
 
-変更には実際のactor、reason、再送用の固有operationを指定する。IDは通常省略してCoreの発行結果を使う。更新・削除・statusの変更では最新のrevisionを使う。同じ操作の再送はoperationとrequestを維持し、conflict時は読み直す。
+変更には実際のactor、reason、再送用の固有operationを指定する。実行由来の変更では現行runを必ず指定する。管理・範囲変更・文書importではmode=managementと外部設定で許可された管理主体を指定し、実行元runと混在させない。終了後の承認はjob.accept_evidenceで検証内容を記録し、waitの解決とJobの遷移をまとめて確定する。IDは通常省略してCoreの発行結果を使う。更新・削除・statusの変更では最新のrevisionを使う。同じ操作の再送はoperationとrequestを維持し、conflict時は読み直す。
 
 Ticketはtask_idで1つのTaskに所属し、確定後のworker_id・session_idは変更しない。実行時のactorには固定のworker_id・session_idをこの順で指定する。Taskの作成ではProject IDをrecord内ではなくparams.parentに渡す。Ticketと全Jobを一括作成し、固定されたobjective・criteria・instructions・Jobの順序を後から書き換えない。summaryやiconはrecordとは別のdisplayに指定する。
 

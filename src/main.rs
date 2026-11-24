@@ -14,6 +14,7 @@ Usage:
   ttjcore import --file FILE [--file FILE ...] --actor JSON --reason TEXT [--operation ID]
 Environment:
   TTJCORE_DATABASE_URL selects SQLite (default) or PostgreSQL for ensure/init/serve.
+  TTJCORE_MANAGEMENT_ACTORS grants named management principals (JSON string array; default none).
   TTJCORE_HOME selects the local Core profile for every command.
 serve owns the DB; call and rpc connect to the running Core without TCP.
 rpc bridges JSON-RPC requests, responses and ttj.changed notifications over stdio.
@@ -113,7 +114,7 @@ async fn run() -> std::result::Result<(), String> {
     }
     if command == "import" {
         let mut documents = vec![];
-        let mut params = json!({});
+        let mut params = json!({"mode":"management"});
         let mut index = 1;
         while index < args.len() {
             let key = &args[index];
