@@ -69,4 +69,4 @@ jq -r '.tasks[0] | [.task.record,.tickets[0].ticket.record,.tickets[0].jobs[0].r
 ttjcore --home "$sample_home" stop
 ```
 
-既存のprofileは変更せず、記録は`$sample_home`内のSQLiteに残ります。`ttj`は参照結果の`result`と更新結果の`result.value`を取り出します。各methodの詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+既存のprofileは変更せず、記録は`$sample_home`内のSQLiteに残ります。`ttj`は参照結果の`result`と更新結果の`result.value`を取り出します。各methodの詳細は[protocol](../skills/ttjcore/references/protocol.md)を参照してください。

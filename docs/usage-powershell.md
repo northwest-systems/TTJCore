@@ -73,4 +73,4 @@ $snapshot = Ttj project.snapshot @{ id = $project.record.id }
 ttjcore --home $sampleHome stop
 ```
 
-既存のprofileは変更せず、記録は`$sampleHome`内のSQLiteに残ります。補助関数は参照結果の`result`と更新結果の`result.value`を取り出します。各methodの詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+既存のprofileは変更せず、記録は`$sampleHome`内のSQLiteに残ります。補助関数は参照結果の`result`と更新結果の`result.value`を取り出します。各methodの詳細は[protocol](../skills/ttjcore/references/protocol.md)を参照してください。

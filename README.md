@@ -33,8 +33,8 @@ ttjcore call project.list
 
 サンプルProjectの作成・更新から作業完了までの操作例です。
 
-- [PowerShell 7](usage-powershell.md)
-- [Bash](usage-bash.md)（JSON処理にjqを使用）
+- [PowerShell 7](docs/usage-powershell.md)
+- [Bash](docs/usage-bash.md)（JSON処理にjqを使用）
 
 ## フォルダ構造
 
@@ -50,6 +50,9 @@ TTJCore/                        # Rust製CLI・Core
 │   ├── app-icon-light.png      # ライト用の透過PNG
 │   ├── app-icon-white.png      # 単色・白の透過PNG
 │   └── app-icon.png            # ダーク用の透過PNG
+├── docs/                       # 操作例
+│   ├── usage-powershell.md     # PowerShell 7の操作例
+│   └── usage-bash.md           # Bashの操作例
 ├── skills/                     # LLM向け利用スキル
 │   └── ttjcore/                # Coreの利用スキル
 │       ├── references/         # 仕様の参照資料
@@ -80,9 +83,7 @@ TTJCore/                        # Rust製CLI・Core
 ├── Cargo.toml                  # package情報・依存crate
 ├── compose.postgres-test.yaml  # PostgreSQL互換性テスト用DB
 ├── LICENSE                     # Apache-2.0ライセンス
-├── README.md                   # 概要・クイックスタート・フォルダ構造
-├── usage-powershell.md         # PowerShell 7の操作例
-└── usage-bash.md               # Bashの操作例
+└── README.md                   # 概要・クイックスタート・フォルダ構造
 ```
 
 Cargoが取得する直接依存は次のとおりです。推移依存のバージョンはCargo.lockに固定しています。
