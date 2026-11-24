@@ -1,6 +1,6 @@
 # TTJCore protocol
 
-TTJCore 0.1.1のCLI・JSON-RPC contractです。`protocol`は`TTJ/1.1.0`です。LLMとHerdrはCoreへ直接接続し、この文書と`ttjcore methods`でinterfaceを確認します。
+TTJCore 0.1.1のCLI・JSON-RPC contractです。`protocol`は`TTJ/1.1.0`です。UIやLLMなどのクライアントはCoreへ直接接続し、この文書と`ttjcore methods`でinterfaceを確認します。
 
 TTJ自体の作業規則は同梱の[TTJ 1.1.0規格本文](ttj-1.1.0/references/specification.md)、項目と例は[JSON参照形式](ttj-1.1.0/references/json-format.md)を参照します。いずれもネット接続なしで読めます。
 
@@ -230,7 +230,7 @@ optionalのprojectで絞り込めます。cursor省略時は現在位置から�
 {"jsonrpc":"2.0","protocol":"TTJ/1.1.0","method":"ttj.changed","params":{"cursor":42,"events":[{"id":42,"project":"<project-id>","target":"<job-id>","event":"status.changed","operation":"example-complete","revision":3,"timestamp":"2026-01-01T00:00:00Z","status":"completed"}]}}
 ```
 
-eventはcommit済みの履歴を参照します。同じoperationの再送では新しいeventを作りません。切断後は最後に受け取ったcursorから再接続します。Herdr Modはevents.waitを使い、変更があったときにsnapshotを更新します。
+eventはcommit済みの履歴を参照します。同じoperationの再送では新しいeventを作りません。切断後は最後に受け取ったcursorから再接続します。クライアントはevents.waitまたはevents.subscribeで変更を監視し、必要に応じてsnapshotを更新します。
 
 eventの種類は`record.created`・`record.updated`・`record.deleted`・`status.changed`・`record.imported`・`run.wait_resolved`・`evidence.accepted`・`run.wait_changed`・`run.started`・`run.finished`・`execution.stop_requested`・`knowledge.superseded`です。eventは変更の概要なので、詳細はgetまたはsnapshotで取得します。Runへのexecution.stop_requestedを受けた場合は、run.getのconstraintsにあるstop_requestedを確認し、実行側で停止に対応してください。
 

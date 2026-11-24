@@ -7,7 +7,7 @@
 
 ## 概要
 
-[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.1です。
+[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは自由に実装でき、CLI・JSON-RPCでCoreに接続します。バージョンは0.1.1です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
@@ -25,9 +25,9 @@ ttjcore ensure
 ttjcore call project.list
 ```
 
-`ttjcore`をPATHから実行できる状態にしてください。`ensure`は標準DBを初期化し、GUIなしでCoreを常駐起動します。すでに起動中なら同じCoreに接続します。Herdr Modの標準接続はこの処理を自動で行うため、日常操作でinit・serveを実行する必要はありません。
+`ttjcore`をPATHから実行できる状態にしてください。`ensure`は標準DBを初期化し、GUIなしでCoreを常駐起動します。すでに起動中なら同じCoreに接続します。
 
-作成IDはCoreが自動発行します。停止は`ttjcore stop`です。Herdrを閉じても、ほかのclientと共有するCoreは停止しません。
+作成IDはCoreが自動発行します。停止は`ttjcore stop`です。クライアントを閉じてもCoreは動作を続けます。
 
 ## フォルダ構造
 
@@ -117,7 +117,7 @@ passwordはURL encodeし、認証・TLS設定に応じた接続optionを指定�
 
 管理操作には、起動時に`TTJCORE_MANAGEMENT_ACTORS`へ許可主体のJSON配列（例：`["operator"]`）を設定し、requestに`mode:"management"`と対応actorを明示します。既定では管理主体を許可しません。実行由来の更新は固定Worker/Sessionと現行Runに結び付けます。詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
 
-DB設定はensure・init・serveが使います。call・rpc・Herdrは同じprofileのCoreに接続し、DBへ直接接続しません。
+DB設定はensure・init・serveが使います。call・rpcと各UIは同じprofileのCoreに接続し、DBへ直接接続しません。
 
 ## API・LLMからの利用
 
