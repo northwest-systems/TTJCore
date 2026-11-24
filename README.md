@@ -7,7 +7,7 @@
 
 ## 概要
 
-[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは自由に実装でき、CLI・JSON-RPCでCoreに接続します。バージョンは0.1.1です。
+[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは自由に実装でき、CLI・JSON-RPCでCoreに接続します。バージョンは0.2.0です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
@@ -35,6 +35,7 @@ ttjcore call project.list
 
 - [PowerShell 7](docs/usage-powershell.md)
 - [Bash](docs/usage-bash.md)（JSON処理にjqを使用）
+- [進捗API・監視CLI・Orca通知](docs/progress-notifications.md)
 
 ## フォルダ構造
 
@@ -52,7 +53,8 @@ TTJCore/                        # Rust製CLI・Core
 │   └── app-icon.png            # ダーク用の透過PNG
 ├── docs/                       # 操作例
 │   ├── usage-powershell.md     # PowerShell 7の操作例
-│   └── usage-bash.md           # Bashの操作例
+│   ├── usage-bash.md           # Bashの操作例
+│   └── progress-notifications.md # 進捗API・監視CLI・Orca通知
 ├── skills/                     # LLM向け利用スキル
 │   └── ttjcore/                # Coreの利用スキル
 │       ├── references/         # 仕様の参照資料
@@ -69,6 +71,7 @@ TTJCore/                        # Rust製CLI・Core
 │   ├── ipc.rs                  # ローカルIPC・stdio bridge
 │   ├── lib.rs                  # Coreのmodule公開
 │   ├── main.rs                 # CLIの入口
+│   ├── progress.rs             # 進捗の監視・OSC 7501出力
 │   ├── rpc.rs                  # JSON-RPCの検証
 │   ├── startup.rs              # 標準DBの準備・常駐Coreの起動
 │   └── store.rs                # ORM・transaction・変更通知
@@ -96,6 +99,7 @@ Cargoが取得する直接依存は次のとおりです。推移依存のバー
 | serde・serde_json | JSON入出力 |
 | time | timezone付き日時の検証・生成 |
 | uuid | record ID・operation ID・接続用tokenの生成 |
+| base64 | OSC 7501の日本語ラベル・メッセージの符号化 |
 
 ## DBとprofile
 

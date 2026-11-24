@@ -1,7 +1,8 @@
 use serde_json::Value;
 use std::{
+    io::{BufRead, BufReader},
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::Duration,
 };
 
@@ -20,6 +21,120 @@ impl Profile {
         eprintln!("CLI {} exited", args[0]);
         output
     }
+}
+
+#[test]
+fn watch_streams_current_progress_and_exits_only_when_ticket_is_terminal() {
+    #[cfg(unix)]
+    let temp_root = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let temp_root = std::env::temp_dir();
+    let profile = Profile(temp_root.join(format!("ttj-watch-{}", uuid::Uuid::new_v4())));
+    assert!(profile.command(&["ensure"]).status.success());
+    let call = |method: &str, params: Value| {
+        let output = profile.command(&["call", method, "--params", &params.to_string()]);
+        assert!(
+            output.status.success(),
+            "{method}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
+        result.get("value").unwrap_or(&result).clone()
+    };
+    call(
+        "document.import",
+        serde_json::json!({"mode":"management","actor":["owner"],"reason":"Watch test","documents":[{
+            "protocol":ttjcore::PROTOCOL,
+            "workers":[{"id":"wkr-abcdef-1","name":"Watcher"}],
+            "sessions":[{"id":"ssn-abcdef-1","worker_id":"wkr-abcdef-1"}],
+            "project":{"id":"pj-abcdef-1","name":"Watch","tasks":[{"id":"tsk-abcdef-1","objective":"Watch progress","criteria":["Verified"],"status":"doing"}]},
+            "tickets":[{"id":"tkt-abcdef-1","task_id":"tsk-abcdef-1","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","objective":"Verify","status":"doing",
+                "jobs":[{"id":"job-abcdef-1","objective":"Observe","criteria":["Verified"],"status":"doing","runs":[{"id":"run-abcdef-1","started":"2026-01-01T00:00:00Z"}]}]}]
+        }]}),
+    );
+    let before = call("ticket.snapshot", serde_json::json!({"id":"tkt-abcdef-1"}));
+    let refused = profile.command(&["watch", "tkt-abcdef-1", "--osc7501"]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires a terminal"));
+    assert_eq!(
+        before,
+        call("ticket.snapshot", serde_json::json!({"id":"tkt-abcdef-1"}))
+    );
+
+    struct Watcher(std::process::Child);
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut watcher = Watcher(
+        Command::new(env!("CARGO_BIN_EXE_ttjcore"))
+            .arg("--home")
+            .arg(&profile.0)
+            .args(["watch", "tkt-abcdef-1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = watcher.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || {
+        let line = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("watch did not publish");
+        assert!(!line.contains('\u{1b}'));
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    assert_eq!(next(), before);
+    call(
+        "run.progress",
+        serde_json::json!({"actor":["wkr-abcdef-1","ssn-abcdef-1"],"reason":"Verify live progress","id":"run-abcdef-1","revision":before["run"]["revision"],"percent":37,"message":"検証中"}),
+    );
+    let updated = next();
+    assert_eq!(
+        updated["run"]["progress"],
+        serde_json::json!({"percent":37,"message":"検証中"})
+    );
+    assert!(updated["cursor"].as_i64().unwrap() > before["cursor"].as_i64().unwrap());
+    call(
+        "run.finish",
+        serde_json::json!({"actor":["wkr-abcdef-1","ssn-abcdef-1"],"reason":"Attempt ended","id":"run-abcdef-1","revision":updated["run"]["revision"],"result":"succeeded"}),
+    );
+    let ended = next();
+    assert_eq!(ended["run"]["active"], false);
+    assert_eq!(ended["ticket"]["record"]["status"], "doing");
+    assert!(watcher.0.try_wait().unwrap().is_none());
+    call(
+        "status.set",
+        serde_json::json!({"mode":"management","actor":["owner"],"reason":"Verified completion","id":"job-abcdef-1","revision":ended["job"]["revision"],"status":"completed","criteria_met":true,"result":"Observed progress"}),
+    );
+    assert_eq!(next()["ticket"]["record"]["status"], "completed");
+    for _ in 0..100 {
+        if watcher.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        watcher
+            .0
+            .try_wait()
+            .unwrap()
+            .expect("watch did not exit")
+            .success()
+    );
+    reader.join().unwrap();
 }
 impl Drop for Profile {
     fn drop(&mut self) {

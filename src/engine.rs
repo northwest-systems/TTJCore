@@ -41,9 +41,17 @@ pub fn terminal(body: &Value) -> bool {
     matches!(body["status"].as_str(), Some("completed" | "canceled"))
 }
 pub fn view(row: &record::Model) -> Value {
-    json!({"kind":row.kind,"record":row.body,"revision":row.revision,"deleted":row.deleted,
-        "started":row.started,"active":row.active,"constraints":row.flags,
-        "display":row.flags.get("display").cloned().unwrap_or(json!({}))})
+    let mut constraints = row.flags.clone();
+    let progress = constraints
+        .as_object_mut()
+        .and_then(|flags| flags.remove("progress"));
+    let mut value = json!({"kind":row.kind,"record":row.body,"revision":row.revision,"deleted":row.deleted,
+        "started":row.started,"active":row.active,"constraints":constraints,
+        "display":row.flags.get("display").cloned().unwrap_or(json!({}))});
+    if let Some(progress) = progress {
+        value["progress"] = progress;
+    }
+    value
 }
 pub fn history_summary(value: Value) -> Value {
     let mut body = serde_json::Map::new();
@@ -216,6 +224,25 @@ impl Engine {
         let mut value = view(row);
         value["record"] = self.record_body(row);
         value
+    }
+    pub fn ticket_snapshot(&self, p: &Value) -> Result<Value> {
+        let ticket = self.get(&text(p, "id")?)?;
+        if ticket.kind != "ticket" {
+            return Err(invalid("id must identify a Ticket"));
+        }
+        let task = self.parent(&ticket)?;
+        let job = self.current(&ticket)?;
+        let run = job.as_ref().and_then(|job| {
+            self.children(&job.id)
+                .into_iter()
+                .filter(|row| row.kind == "run" && !row.deleted)
+                .max_by_key(|row| row.flags["order"].as_u64().unwrap_or(0))
+        });
+        Ok(
+            json!({"project_id":self.project(&ticket)?,"task":self.record_view(&task),
+            "ticket":self.record_view(&ticket),"job":job.as_ref().map(|row|self.record_view(row)),
+            "run":run.as_ref().map(|row|self.record_view(row))}),
+        )
     }
     fn children(&self, id: &str) -> Vec<record::Model> {
         self.rows
@@ -1124,6 +1151,53 @@ impl Engine {
         self.save(run, "run.finished")?;
         Ok(self.record_view(&self.get(&id)?))
     }
+    pub fn report_progress(&mut self, p: &Value) -> Result<Value> {
+        if p.get("mode").is_some_and(|mode| mode != "execution") {
+            return Err(rule(
+                "Run progress must be reported by its execution Session",
+            ));
+        }
+        let mut run = self.expect(p)?;
+        self.authorize_run(&json!(run.id), &run)?;
+        if p.get("percent").is_none() && p.get("message").is_none() {
+            return Err(invalid("percent or message is required"));
+        }
+        let mut progress = run.flags.get("progress").cloned().unwrap_or(json!({}));
+        for field in ["percent", "message"] {
+            let Some(value) = p.get(field) else {
+                continue;
+            };
+            if value.is_null() {
+                progress.as_object_mut().unwrap().remove(field);
+                continue;
+            }
+            if field == "percent" {
+                if value.as_u64().is_none_or(|percent| percent > 100) {
+                    return Err(invalid("percent must be an integer from 0 to 100 or null"));
+                }
+            } else {
+                let message = text(p, "message")?;
+                if message.len() > 2048
+                    || message
+                        .chars()
+                        .any(|c| c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c))
+                {
+                    return Err(invalid(
+                        "message must be a single line of at most 2048 UTF-8 bytes without control characters",
+                    ));
+                }
+            }
+            progress[field] = value.clone();
+        }
+        if progress.as_object().unwrap().is_empty() {
+            run.flags.as_object_mut().unwrap().remove("progress");
+        } else {
+            run.flags["progress"] = progress;
+        }
+        let id = run.id.clone();
+        self.save(run, "run.progress_changed")?;
+        Ok(self.record_view(&self.get(&id)?))
+    }
     fn authorize_run(&self, value: &Value, target: &record::Model) -> Result<()> {
         let run = self.get(value.as_str().ok_or_else(|| invalid("run must be an ID"))?)?;
         if run.kind != "run" || !run.active || run.body.get("result").is_some() {
@@ -1709,6 +1783,7 @@ impl Engine {
             "run.start" => self.start_run(p),
             "run.finish" => self.finish_run(p),
             "run.wait" => self.wait_run(p),
+            "run.progress" => self.report_progress(p),
             _ => {
                 let (kind, action) = method
                     .split_once('.')

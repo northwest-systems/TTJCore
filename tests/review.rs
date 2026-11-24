@@ -93,6 +93,160 @@ async fn snapshot(db: &Store) -> Value {
 }
 
 #[tokio::test]
+async fn progress_is_run_telemetry_with_atomic_snapshots_and_no_document_fields() {
+    let db = database().await;
+    seed(&db, &[J]).await;
+    start(&db, J, R).await.unwrap();
+    let document = db
+        .call("document.export", json!({"project":P}))
+        .await
+        .unwrap();
+    let p = json!({"operation":"progress-once","id":R,"revision":get(&db,"run",R).await["revision"],"percent":37,"message":"検証中"});
+    let first = execution(&db, "run.progress", p.clone()).await.unwrap();
+    let before_replay = snapshot(&db).await;
+    assert_eq!(execution(&db, "run.progress", p).await.unwrap(), first);
+    assert_eq!(snapshot(&db).await, before_replay);
+    assert_eq!(first["progress"], json!({"percent":37,"message":"検証中"}));
+    assert!(first["record"].get("progress").is_none());
+    assert!(first["constraints"].get("progress").is_none());
+    let current = db.call("ticket.snapshot", json!({"id":A})).await.unwrap();
+    assert_eq!(current["run"], first);
+    assert_eq!(current["job"]["record"]["id"], J);
+    assert_eq!(current["task"]["record"]["id"], T);
+    assert_eq!(current["project_id"], P);
+    assert_eq!(current["cursor"], before_replay["cursor"]);
+    assert_eq!(
+        db.call("document.export", json!({"project":P}))
+            .await
+            .unwrap(),
+        document
+    );
+    for (patch, expected) in [
+        (
+            json!({"percent":100}),
+            json!({"percent":100,"message":"検証中"}),
+        ),
+        (json!({"message":null}), json!({"percent":100})),
+        (json!({"percent":null}), Value::Null),
+    ] {
+        let mut p = json!({"id":R,"revision":get(&db,"run",R).await["revision"]});
+        for (key, value) in patch.as_object().unwrap() {
+            p[key] = value.clone();
+        }
+        let result = execution(&db, "run.progress", p).await.unwrap();
+        assert_eq!(result["progress"], expected);
+        assert_eq!(get(&db, "job", J).await["record"]["status"], "doing");
+        assert_eq!(get(&db, "ticket", A).await["record"]["status"], "doing");
+    }
+    let events = db
+        .call("events.list", json!({"cursor":0,"project":P}))
+        .await
+        .unwrap();
+    assert_eq!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "run.progress_changed")
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn progress_rejections_are_unchanged_and_retries_do_not_inherit_telemetry() {
+    let db = database().await;
+    seed(&db, &[J]).await;
+    start(&db, J, R).await.unwrap();
+    for patch in [
+        json!({}),
+        json!({"percent":-1}),
+        json!({"percent":101}),
+        json!({"percent":1.5}),
+        json!({"percent":true}),
+        json!({"message":""}),
+        json!({"message":"line\nbreak"}),
+        json!({"message":"\u{009b}"}),
+        json!({"message":"あ".repeat(683)}),
+        json!({"mode":"management","percent":10}),
+    ] {
+        let before = (snapshot(&db).await, get(&db, "run", R).await);
+        let mut p = json!({"id":R,"revision":before.1["revision"]});
+        for (key, value) in patch.as_object().unwrap() {
+            p[key] = value.clone();
+        }
+        assert!(execution(&db, "run.progress", p).await.is_err());
+        assert_eq!(before, (snapshot(&db).await, get(&db, "run", R).await));
+    }
+    let mut p = json!({"id":R,"revision":get(&db,"run",R).await["revision"],"percent":40});
+    let before = snapshot(&db).await;
+    p["actor"] = json!([W, "ssn-review-2"]);
+    assert!(call(&db, "run.progress", p).await.is_err());
+    assert_eq!(before, snapshot(&db).await);
+    assert!(
+        admin(
+            &db,
+            "run.progress",
+            json!({"id":R,"revision":get(&db,"run",R).await["revision"],"percent":40})
+        )
+        .await
+        .is_err()
+    );
+    execution(&db,"run.progress",json!({"id":R,"revision":get(&db,"run",R).await["revision"],"percent":40,"message":"First attempt"})).await.unwrap();
+    let before = snapshot(&db).await;
+    assert!(
+        execution(
+            &db,
+            "run.progress",
+            json!({"id":R,"revision":0,"percent":41})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(before, snapshot(&db).await);
+    state(&db, "task", T, "paused", json!({})).await.unwrap();
+    execution(
+        &db,
+        "run.progress",
+        json!({"id":R,"revision":get(&db,"run",R).await["revision"],"message":"Stopping safely"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(get(&db, "task", T).await["record"]["status"], "paused");
+    finish(&db, R).await;
+    let before = snapshot(&db).await;
+    assert!(
+        execution(
+            &db,
+            "run.progress",
+            json!({"id":R,"revision":get(&db,"run",R).await["revision"],"percent":80})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(before, snapshot(&db).await);
+    state(&db, "task", T, "doing", json!({"release":true}))
+        .await
+        .unwrap();
+    start(&db, J, "run-review-2").await.unwrap();
+    let current = db.call("ticket.snapshot", json!({"id":A})).await.unwrap();
+    assert_eq!(current["run"]["record"]["id"], "run-review-2");
+    assert!(current["run"].get("progress").is_none());
+    admin(&db,"session.update",json!({"id":S,"revision":get(&db,"session",S).await["revision"],"patch":{"ended":"2026-11-24T00:00:00Z"}})).await.unwrap();
+    let before = snapshot(&db).await;
+    assert!(
+        execution(
+            &db,
+            "run.progress",
+            json!({"id":"run-review-2","revision":current["run"]["revision"],"percent":1})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(before, snapshot(&db).await);
+}
+
+#[tokio::test]
 async fn execution_handoff_matches_its_ticket_job_worker_and_session() {
     let db = database().await;
     seed(&db, &[J, K]).await;

@@ -2,6 +2,7 @@ pub mod document;
 pub mod engine;
 pub mod entity;
 pub mod ipc;
+pub mod progress;
 pub mod rpc;
 pub mod store;
 
