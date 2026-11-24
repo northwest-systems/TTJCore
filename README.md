@@ -7,11 +7,11 @@
 
 ## 概要
 
-[TTJ 1.0.0](https://github.com/northwest-systems/TTJ)に従い、Project → Task → Ticket → Job、Run、ProjectのKnowledgeを管理するRust製CLIです。UIは[Herdr TTJ Mod](https://github.com/northwest-systems/herdr-mods-TTJ)が担当します。バージョンは0.1.1です。
+[TTJ 1.1.0](https://github.com/northwest-systems/TTJ)に従い、Project・Task・Ticket・Job・Run・Worker・SessionとProjectのKnowledgeを管理するRust製CLIです。UIは自由に実装でき、CLI・JSON-RPCでCoreに接続します。バージョンは0.1.1です。
 
 SQLiteを標準とし、SeaORMを介して任意のPostgreSQLへ切り替えられます。変更・履歴・再送結果を同じtransactionで保存します。CoreはTCPポートを開かず、Windowsではnamed pipe、Linux・macOSではUnix domain socketを使用します。
 
-Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。終了したTaskは`task.purge`で配下を一括物理削除し、要約履歴とProjectのKnowledgeを残せます。既存の`delete`操作は履歴・依存参照を残す論理削除です。
+Taskは単一のproject内に置き、Ticketはルートtickets配列からtask_idでTaskを参照します。WorkerとSessionでTicketの固定担当を識別します。Ticketと順序付きJobは一括作成し、作成後の計画変更を拒否します。終了したTaskは`task.purge`で配下を一括物理削除し、要約履歴とProjectのKnowledgeを残せます。既存の`delete`操作は履歴・依存参照を残す論理削除です。
 
 ## クイックスタート
 
@@ -20,15 +20,21 @@ Taskは複数のTicketを持ち、Ticketは1つのTaskに所属します。Ticke
 ```sh
 git clone https://github.com/northwest-systems/TTJCore.git
 cd TTJCore
-git checkout v0.1.1
 cargo install --path . --locked
 ttjcore ensure
 ttjcore call project.list
 ```
 
-`ttjcore`をPATHから実行できる状態にしてください。`ensure`は標準DBを初期化し、GUIなしでCoreを常駐起動します。すでに起動中なら同じCoreに接続します。Herdr Modの標準接続はこの処理を自動で行うため、日常操作でinit・serveを実行する必要はありません。
+`ttjcore`をPATHから実行できる状態にしてください。`ensure`は標準DBを初期化し、GUIなしでCoreを常駐起動します。すでに起動中なら同じCoreに接続します。
 
-作成IDはCoreが自動発行します。停止は`ttjcore stop`です。Herdrを閉じても、ほかのclientと共有するCoreは停止しません。
+作成IDはCoreが自動発行します。停止は`ttjcore stop`です。クライアントを閉じてもCoreは動作を続けます。
+
+## コマンド操作の例
+
+サンプルProjectの作成・更新から作業完了までの操作例です。
+
+- [PowerShell 7](docs/usage-powershell.md)
+- [Bash](docs/usage-bash.md)（JSON処理にjqを使用）
 
 ## フォルダ構造
 
@@ -44,16 +50,20 @@ TTJCore/                        # Rust製CLI・Core
 │   ├── app-icon-light.png      # ライト用の透過PNG
 │   ├── app-icon-white.png      # 単色・白の透過PNG
 │   └── app-icon.png            # ダーク用の透過PNG
+├── docs/                       # 操作例
+│   ├── usage-powershell.md     # PowerShell 7の操作例
+│   └── usage-bash.md           # Bashの操作例
 ├── skills/                     # LLM向け利用スキル
 │   └── ttjcore/                # Coreの利用スキル
 │       ├── references/         # 仕様の参照資料
-│       │   ├── ttj-1.0.0/      # オフラインで読む固定版のTTJ規格
-│       │   │   ├── json-format.md    # TTJの項目と記入例
-│       │   │   ├── LICENSE           # TTJ規格のApache-2.0ライセンス
-│       │   │   └── specification.md  # TTJ 1.0.0の作業規則
+│       │   ├── ttj-1.1.0/      # オフラインのTTJ規格・skill
+│       │   │   ├── SKILL.md
+│       │   │   ├── LICENSE
+│       │   │   └── references/ # specification・json-format・use-cases
 │       │   └── protocol.md     # CLI・JSON-RPC・eventの仕様
 │       └── SKILL.md            # LLM向けの操作手順
 ├── src/                        # Rustソース
+│   ├── document.rs             # TTJ 1.1.0の型・検証・ファイル分割
 │   ├── engine.rs               # TTJの規則・CRUD・status変更
 │   ├── entity.rs               # SeaORMのtable定義
 │   ├── ipc.rs                  # ローカルIPC・stdio bridge
@@ -64,6 +74,7 @@ TTJCore/                        # Rust製CLI・Core
 │   └── store.rs                # ORM・transaction・変更通知
 ├── tests/                      # 自動テスト
 │   ├── contract.rs             # SQLite・PostgreSQLの動作契約
+│   ├── document.rs             # 1.1.0の入出力・連番・Session・待機循環
 │   ├── ipc.rs                  # IPC経由の呼び出し
 │   ├── purge.rs                # Task物理削除・要約履歴・容量回収
 │   └── startup.rs              # Coreの自動起動・停止
@@ -114,13 +125,15 @@ ttjcore ensure
 
 passwordはURL encodeし、認証・TLS設定に応じた接続optionを指定します。接続情報をGitへ保存しないでください。すでに起動中のCoreは設定変更で切り替わりません。同じprofileのCoreをstopしてからensureしてください。initはschema作成、serveはforeground起動として引き続き使用でき、serveはCtrl+Cでも停止できます。
 
-DB設定はensure・init・serveが使います。call・rpc・Herdrは同じprofileのCoreに接続し、DBへ直接接続しません。
+管理操作には、起動時に`TTJCORE_MANAGEMENT_ACTORS`へ許可主体のJSON配列（例：`["operator"]`）を設定し、requestに`mode:"management"`と対応actorを明示します。既定では管理主体を許可しません。実行由来の更新は固定Worker/Sessionと現行Runに結び付けます。詳細は[protocol](skills/ttjcore/references/protocol.md)を参照してください。
+
+DB設定はensure・init・serveが使います。call・rpcと各UIは同じprofileのCoreに接続し、DBへ直接接続しません。
 
 ## API・LLMからの利用
 
 CLI・JSON-RPC・eventの仕様は[protocol](skills/ttjcore/references/protocol.md)、LLM向けの入口は[skills/ttjcore/SKILL.md](skills/ttjcore/SKILL.md)です。
 
-Skillには[TTJ 1.0.0規格本文](skills/ttjcore/references/ttj-1.0.0/specification.md)・[JSON参照形式](skills/ttjcore/references/ttj-1.0.0/json-format.md)とライセンスを固定版として同梱しています。`skills/ttjcore`を参照資料ごとコピーすれば、ネット接続なしでTTJの規則とCoreの操作を確認できます。
+Skillには[TTJ 1.1.0規格本文](skills/ttjcore/references/ttj-1.1.0/references/specification.md)・[JSON参照形式](skills/ttjcore/references/ttj-1.1.0/references/json-format.md)とライセンスを固定版として同梱しています。`skills/ttjcore`を参照資料ごとコピーすれば、ネット接続なしでTTJの規則とCoreの操作を確認できます。
 
 ## テスト
 

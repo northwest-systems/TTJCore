@@ -1,10 +1,15 @@
 use serde_json::{Value, json};
 use ttjcore::{PROTOCOL, rpc, store::Store};
 async fn db() -> Store {
-    Store::connect("sqlite::memory:", true).await.unwrap()
+    connect("sqlite::memory:", true).await.unwrap()
 }
 async fn change(db: &Store, method: &str, mut p: Value) -> ttjcore::Result<Value> {
-    p["actor"] = json!(["operator"]);
+    if method.starts_with("run.") || p.get("run").is_some() {
+        p["actor"] = json!(["wkr-abcdef-1", "ssn-abcdef-1"]);
+    } else {
+        p["actor"] = json!(["owner"]);
+        p["mode"] = json!("management");
+    }
     p["reason"] = json!("Contract test");
     db.call(method, p).await
 }
@@ -16,21 +21,36 @@ async fn get(db: &Store, kind: &str, id: &str) -> Value {
 async fn seed(db: &Store) {
     change(
         db,
+        "worker.create",
+        json!({"record":{"id":"wkr-abcdef-1","name":"Operator"}}),
+    )
+    .await
+    .unwrap();
+    change(
+        db,
+        "session.create",
+        json!({"record":{"id":"ssn-abcdef-1","worker_id":"wkr-abcdef-1"}}),
+    )
+    .await
+    .unwrap();
+
+    change(
+        db,
         "project.create",
-        json!({"record":{"id":"p","name":"Demo"}}),
+        json!({"record":{"id":"pj-abcdef-1","name":"Demo"}}),
     )
     .await
     .unwrap();
     change(
         db,
         "task.create",
-        json!({"record":{"id":"t","project":"p","objective":"Deliver","criteria":["Verified"]}}),
+        json!({"parent":"pj-abcdef-1","record":{"id":"tsk-abcdef-1","objective":"Deliver","criteria":["Verified"]}}),
     )
     .await
     .unwrap();
 }
 async fn ticket(db: &Store, id: &str, jobs: &[&str], depends: &[&str]) -> Value {
-    change(db,"ticket.create",json!({"record":{"id":id,"task":"t","objective":id,"depends":depends,
+    change(db,"ticket.create",json!({"record":{"id":id,"worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-1","objective":id,"depends":depends,
  "jobs":jobs.iter().map(|id|json!({"id":id,"objective":id,"criteria":["Verified"]})).collect::<Vec<_>>()}})).await.unwrap()
 }
 async fn state(
@@ -42,6 +62,9 @@ async fn state(
 ) -> ttjcore::Result<Value> {
     let r = get(db, kind, id).await;
     let mut p = json!({"id":id,"revision":r["revision"],"status":status});
+    if kind == "ticket" && status == "canceled" {
+        p["cancel_reason"] = json!("Scope canceled");
+    }
     for (k, v) in extra.as_object().unwrap() {
         p[k] = v.clone();
     }
@@ -52,7 +75,7 @@ async fn start(db: &Store, job: &str, id: &str) -> ttjcore::Result<Value> {
     change(
         db,
         "run.start",
-        json!({"id":id,"job":job,"revision":j["revision"]}),
+        json!({"id":id,"job":job,"revision":j["revision"],"safety":"Previous execution stopped"}),
     )
     .await
 }
@@ -80,28 +103,32 @@ async fn complete(db: &Store, id: &str) {
 async fn atomic_create_replay_and_conflicts() {
     let db = db().await;
     seed(&db).await;
-    assert!(change(&db,"ticket.create",json!({"record":{"id":"bad","task":"t","objective":"Bad","jobs":[
- {"id":"orphan","objective":"First","criteria":["OK"]},{"id":"invalid","objective":"Second","criteria":[]}]}})).await.is_err());
-    assert!(db.call("job.get", json!({"id":"orphan"})).await.is_err());
-    let p = json!({"operation":"once","record":{"id":"p2","name":"Second"}});
+    assert!(change(&db,"ticket.create",json!({"record":{"id":"tkt-abcdef-7","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-1","objective":"Bad","jobs":[
+ {"id":"job-abcdef-7","objective":"First","criteria":["OK"]},{"id":"job-abcdef-8","objective":"Second","criteria":[]}]}})).await.is_err());
+    assert!(
+        db.call("job.get", json!({"id":"job-abcdef-7"}))
+            .await
+            .is_err()
+    );
+    let p = json!({"operation":"once","record":{"id":"pj-abcdef-2","name":"Second"}});
     let first = change(&db, "project.create", p.clone()).await.unwrap();
     assert_eq!(first, change(&db, "project.create", p).await.unwrap());
     assert_eq!(
         change(
             &db,
             "project.create",
-            json!({"operation":"once","record":{"id":"p3","name":"Other"}})
+            json!({"operation":"once","record":{"id":"pj-abcdef-3","name":"Other"}})
         )
         .await
         .unwrap_err()
         .code,
         -32009
     );
-    let r = get(&db, "project", "p2").await;
+    let r = get(&db, "project", "pj-abcdef-2").await;
     change(
         &db,
         "project.update",
-        json!({"id":"p2","revision":r["revision"],"patch":{"name":"Updated"}}),
+        json!({"id":"pj-abcdef-2","revision":r["revision"],"patch":{"name":"Updated"}}),
     )
     .await
     .unwrap();
@@ -109,67 +136,91 @@ async fn atomic_create_replay_and_conflicts() {
         change(
             &db,
             "project.update",
-            json!({"id":"p2","revision":r["revision"],"patch":{"name":"Stale"}})
+            json!({"id":"pj-abcdef-2","revision":r["revision"],"patch":{"name":"Stale"}})
         )
         .await
         .unwrap_err()
         .code,
         -32009
     );
-    assert_eq!(get(&db, "project", "p2").await["record"]["name"], "Updated");
+    assert_eq!(
+        get(&db, "project", "pj-abcdef-2").await["record"]["name"],
+        "Updated"
+    );
 }
 #[tokio::test]
 async fn fixed_plan_dependencies_and_job_order() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1", "a2"], &[]).await;
-    ticket(&db, "b", &["b1"], &["a"]).await;
-    let a = get(&db, "ticket", "a").await;
-    for patch in [json!({"objective":"Changed"}), json!({"depends":["b"]})] {
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1", "job-abcdef-2"], &[]).await;
+    ticket(&db, "tkt-abcdef-2", &["job-abcdef-3"], &["tkt-abcdef-1"]).await;
+    let a = get(&db, "ticket", "tkt-abcdef-1").await;
+    for patch in [
+        json!({"objective":"Changed"}),
+        json!({"depends":["tkt-abcdef-2"]}),
+    ] {
         assert!(
             change(
                 &db,
                 "ticket.update",
-                json!({"id":"a","revision":a["revision"],"patch":patch})
+                json!({"id":"tkt-abcdef-1","revision":a["revision"],"patch":patch})
             )
             .await
             .is_err()
         );
     }
-    assert!(start(&db, "a2", "wrong-order").await.is_err());
-    assert!(start(&db, "b1", "wrong-dependency").await.is_err());
-    assert_eq!(get(&db, "ticket", "b").await["record"]["status"], "waiting");
+    assert!(start(&db, "job-abcdef-2", "run-abcdef-8").await.is_err());
+    assert!(start(&db, "job-abcdef-3", "run-abcdef-9").await.is_err());
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-2").await["record"]["status"],
+        "waiting"
+    );
 }
 #[tokio::test]
 async fn run_results_and_completion_aggregation() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1", "a2"], &[]).await;
-    ticket(&db, "b", &["b1"], &["a"]).await;
-    start(&db, "a1", "r").await.unwrap();
-    assert_eq!(get(&db, "task", "t").await["record"]["status"], "doing");
-    finish(&db, "r").await.unwrap();
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1", "job-abcdef-2"], &[]).await;
+    ticket(&db, "tkt-abcdef-2", &["job-abcdef-3"], &["tkt-abcdef-1"]).await;
+    start(&db, "job-abcdef-1", "run-abcdef-1").await.unwrap();
     assert_eq!(
-        state(&db, "a1", "job", "waiting", json!({"run":"r"}))
-            .await
-            .unwrap_err()
-            .code,
+        get(&db, "task", "tsk-abcdef-1").await["record"]["status"],
+        "doing"
+    );
+    finish(&db, "run-abcdef-1").await.unwrap();
+    assert_eq!(
+        state(
+            &db,
+            "job-abcdef-1",
+            "job",
+            "waiting",
+            json!({"run":"run-abcdef-1"})
+        )
+        .await
+        .unwrap_err()
+        .code,
         -32010
     );
-    assert_eq!(get(&db, "job", "a1").await["record"]["status"], "doing");
-    complete(&db, "a1").await;
-    state(&db, "a2", "job", "canceled", json!({}))
+    assert_eq!(
+        get(&db, "job", "job-abcdef-1").await["record"]["status"],
+        "doing"
+    );
+    complete(&db, "job-abcdef-1").await;
+    state(&db, "job-abcdef-2", "job", "canceled", json!({}))
         .await
         .unwrap();
     assert_eq!(
-        get(&db, "ticket", "a").await["record"]["status"],
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
         "completed"
     );
-    assert_eq!(get(&db, "ticket", "b").await["record"]["status"], "todo");
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-2").await["record"]["status"],
+        "todo"
+    );
     assert!(
         state(
             &db,
-            "t",
+            "tsk-abcdef-1",
             "task",
             "completed",
             json!({"criteria_met":true,"result":"Claim"})
@@ -177,12 +228,12 @@ async fn run_results_and_completion_aggregation() {
         .await
         .is_err()
     );
-    state(&db, "b", "ticket", "canceled", json!({}))
+    state(&db, "tkt-abcdef-2", "ticket", "canceled", json!({}))
         .await
         .unwrap();
     state(
         &db,
-        "t",
+        "tsk-abcdef-1",
         "task",
         "completed",
         json!({"criteria_met":true,"result":"Scope checked"}),
@@ -193,8 +244,8 @@ async fn run_results_and_completion_aggregation() {
         change(
             &db,
             "ticket.create",
-            json!({"record":{"id":"late","task":"t","objective":"Late",
- "jobs":[{"id":"late-job","objective":"Late","criteria":["OK"]}]}})
+            json!({"record":{"id":"tkt-abcdef-6","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-1","objective":"Late",
+ "jobs":[{"id":"job-abcdef-6","objective":"Late","criteria":["OK"]}]}})
         )
         .await
         .is_err()
@@ -204,19 +255,22 @@ async fn run_results_and_completion_aggregation() {
 async fn cancellation_is_terminal_and_revokes_runs() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1"], &[]).await;
-    start(&db, "a1", "r").await.unwrap();
-    state(&db, "a", "ticket", "canceled", json!({}))
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1"], &[]).await;
+    start(&db, "job-abcdef-1", "run-abcdef-1").await.unwrap();
+    state(&db, "tkt-abcdef-1", "ticket", "canceled", json!({}))
         .await
         .unwrap();
-    assert_eq!(get(&db, "job", "a1").await["record"]["status"], "canceled");
     assert_eq!(
-        get(&db, "ticket", "a").await["record"]["status"],
+        get(&db, "job", "job-abcdef-1").await["record"]["status"],
         "canceled"
     );
-    assert!(finish(&db, "r").await.is_err());
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
+        "canceled"
+    );
+    assert!(finish(&db, "run-abcdef-1").await.is_err());
     assert!(
-        state(&db, "a", "ticket", "completed", json!({}))
+        state(&db, "tkt-abcdef-1", "ticket", "completed", json!({}))
             .await
             .is_err()
     );
@@ -225,25 +279,42 @@ async fn cancellation_is_terminal_and_revokes_runs() {
 async fn pause_retains_issues_and_aggregation_overrides_pause() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1"], &[]).await;
-    start(&db, "a1", "r").await.unwrap();
-    state(&db, "a", "ticket", "paused", json!({}))
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1"], &[]).await;
+    start(&db, "job-abcdef-1", "run-abcdef-1").await.unwrap();
+    state(&db, "tkt-abcdef-1", "ticket", "paused", json!({}))
         .await
         .unwrap();
-    state(&db, "a1", "job", "blocked", json!({})).await.unwrap();
-    assert_eq!(get(&db, "ticket", "a").await["record"]["status"], "paused");
-    assert!(
-        state(&db, "a", "ticket", "doing", json!({"resolved":true}))
-            .await
-            .is_err()
-    );
-    state(&db, "a1", "job", "doing", json!({"resolved":true}))
+    state(&db, "job-abcdef-1", "job", "blocked", json!({}))
         .await
         .unwrap();
-    finish(&db, "r").await.unwrap();
-    complete(&db, "a1").await;
     assert_eq!(
-        get(&db, "ticket", "a").await["record"]["status"],
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
+        "paused"
+    );
+    assert!(
+        state(
+            &db,
+            "tkt-abcdef-1",
+            "ticket",
+            "doing",
+            json!({"resolved":true})
+        )
+        .await
+        .is_err()
+    );
+    state(
+        &db,
+        "job-abcdef-1",
+        "job",
+        "doing",
+        json!({"resolved":true}),
+    )
+    .await
+    .unwrap();
+    finish(&db, "run-abcdef-1").await.unwrap();
+    complete(&db, "job-abcdef-1").await;
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
         "completed"
     );
 }
@@ -251,70 +322,91 @@ async fn pause_retains_issues_and_aggregation_overrides_pause() {
 async fn blocked_waiting_and_unstarted_recovery() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1"], &[]).await;
-    state(&db, "a1", "job", "blocked", json!({})).await.unwrap();
-    state(&db, "a1", "job", "waiting", json!({"resolved":true}))
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1"], &[]).await;
+    state(&db, "job-abcdef-1", "job", "blocked", json!({}))
         .await
         .unwrap();
-    assert_eq!(get(&db, "ticket", "a").await["record"]["status"], "waiting");
-    state(&db, "a1", "job", "todo", json!({"resolved":true}))
+    state(
+        &db,
+        "job-abcdef-1",
+        "job",
+        "waiting",
+        json!({"resolved":true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
+        "waiting"
+    );
+    state(&db, "job-abcdef-1", "job", "todo", json!({"resolved":true}))
         .await
         .unwrap();
-    assert_eq!(get(&db, "ticket", "a").await["record"]["status"], "todo");
+    assert_eq!(
+        get(&db, "ticket", "tkt-abcdef-1").await["record"]["status"],
+        "todo"
+    );
 }
 #[tokio::test]
 async fn deletion_retains_dependencies_history_and_knowledge() {
     let db = db().await;
     seed(&db).await;
-    ticket(&db, "a", &["a1"], &[]).await;
-    ticket(&db, "b", &["b1"], &["a"]).await;
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1"], &[]).await;
+    ticket(&db, "tkt-abcdef-2", &["job-abcdef-3"], &["tkt-abcdef-1"]).await;
     change(
         &db,
         "knowledge.create",
-        json!({"record":{"id":"k","project":"p","content":"Decision","basis":"Verified"}}),
+        json!({"parent":"pj-abcdef-1","record":{"id":"k","content":"Decision","basis":"Verified"}}),
     )
     .await
     .unwrap();
-    state(&db, "a1", "job", "canceled", json!({}))
+    state(&db, "job-abcdef-1", "job", "canceled", json!({}))
         .await
         .unwrap();
-    let a = get(&db, "ticket", "a").await;
+    let a = get(&db, "ticket", "tkt-abcdef-1").await;
     change(
         &db,
         "ticket.delete",
-        json!({"id":"a","revision":a["revision"]}),
+        json!({"id":"tkt-abcdef-1","revision":a["revision"]}),
     )
     .await
     .unwrap();
-    assert!(db.call("ticket.get", json!({"id":"a"})).await.is_err());
-    assert_eq!(
-        db.call("ticket.get", json!({"id":"a","include_deleted":true}))
+    assert!(
+        db.call("ticket.get", json!({"id":"tkt-abcdef-1"}))
             .await
-            .unwrap()["record"]["status"],
+            .is_err()
+    );
+    assert_eq!(
+        db.call(
+            "ticket.get",
+            json!({"id":"tkt-abcdef-1","include_deleted":true})
+        )
+        .await
+        .unwrap()["record"]["status"],
         "completed"
     );
-    start(&db, "b1", "rb").await.unwrap();
-    finish(&db, "rb").await.unwrap();
-    complete(&db, "b1").await;
+    start(&db, "job-abcdef-3", "run-abcdef-2").await.unwrap();
+    finish(&db, "run-abcdef-2").await.unwrap();
+    complete(&db, "job-abcdef-3").await;
     state(
         &db,
-        "t",
+        "tsk-abcdef-1",
         "task",
         "completed",
         json!({"criteria_met":true,"result":"Checked"}),
     )
     .await
     .unwrap();
-    let t = get(&db, "task", "t").await;
+    let t = get(&db, "task", "tsk-abcdef-1").await;
     change(
         &db,
         "task.delete",
-        json!({"id":"t","revision":t["revision"]}),
+        json!({"id":"tsk-abcdef-1","revision":t["revision"]}),
     )
     .await
     .unwrap();
     let snapshot = db
-        .call("project.snapshot", json!({"id":"p"}))
+        .call("project.snapshot", json!({"id":"pj-abcdef-1"}))
         .await
         .unwrap();
     assert!(snapshot["tasks"].as_array().unwrap().is_empty());
@@ -334,11 +426,11 @@ async fn knowledge_replacement_preserves_old_content() {
     change(
         &db,
         "knowledge.create",
-        json!({"record":{"id":"old","project":"p","content":"Old","basis":"Initial"}}),
+        json!({"parent":"pj-abcdef-1","record":{"id":"old","content":"Old","basis":"Initial"}}),
     )
     .await
     .unwrap();
-    change(&db,"knowledge.create",json!({"record":{"id":"new","project":"p","content":"New","basis":"Correction","supersedes":"old"}})).await.unwrap();
+    change(&db,"knowledge.create",json!({"parent":"pj-abcdef-1","record":{"id":"new","content":"New","basis":"Correction","supersedes":"old"}})).await.unwrap();
     assert_eq!(
         get(&db, "knowledge", "old").await["record"]["status"],
         "supersed"
@@ -393,17 +485,32 @@ async fn rpc_protocol_errors_batches_and_notifications() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database"]
 async fn postgres_contract() {
-    let db = Store::connect(
+    let db = connect(
         &std::env::var("TTJCORE_TEST_POSTGRES_URL").expect("Set test database URL"),
         true,
     )
     .await
     .unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let task = format!("task-{id}");
-    let ticket_id = format!("ticket-{id}");
-    let job = format!("job-{id}");
-    let run = format!("run-{id}");
+    let series = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let id = format!("pj-{series}-1");
+    change(
+        &db,
+        "worker.create",
+        json!({"record":{"id":"wkr-abcdef-1","name":"Operator"}}),
+    )
+    .await
+    .unwrap();
+    change(
+        &db,
+        "session.create",
+        json!({"record":{"id":"ssn-abcdef-1","worker_id":"wkr-abcdef-1"}}),
+    )
+    .await
+    .unwrap();
+    let task = format!("tsk-{series}-1");
+    let ticket_id = format!("tkt-{series}-1");
+    let job = format!("job-{series}-1");
+    let run = format!("run-{series}-1");
     let knowledge = format!("knowledge-{id}");
     change(
         &db,
@@ -420,8 +527,8 @@ async fn postgres_contract() {
     )
     .await
     .unwrap();
-    let create = json!({"operation":format!("create-{task}"),"record":{
-        "id":task,"project":id,"objective":"Verify PostgreSQL","criteria":["Contract verified"]}});
+    let create = json!({"operation":format!("create-{task}"),"parent":id,"record":{
+        "id":task,"objective":"Verify PostgreSQL","criteria":["Contract verified"]}});
     let created = change(&db, "task.create", create.clone()).await.unwrap();
     assert_eq!(created, change(&db, "task.create", create).await.unwrap());
     let invalid_job = format!("invalid-{job}");
@@ -430,7 +537,7 @@ async fn postgres_contract() {
             &db,
             "ticket.create",
             json!({"record":{
-        "id":format!("invalid-{ticket_id}"),"task":task,"objective":"Invalid plan",
+        "id":format!("invalid-{ticket_id}"),"worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":task,"objective":"Invalid plan",
         "jobs":[{"id":invalid_job,"objective":"Invalid","criteria":[]}]}})
         )
         .await
@@ -438,12 +545,12 @@ async fn postgres_contract() {
     );
     assert!(db.call("job.get", json!({"id":invalid_job})).await.is_err());
     change(&db,"ticket.create",json!({"record":{
-        "id":ticket_id,"task":task,"objective":"Work","jobs":[{"id":job,"objective":"Verify","criteria":["Checked"]}]}})).await.unwrap();
+        "id":ticket_id,"worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":task,"objective":"Work","jobs":[{"id":job,"objective":"Verify","criteria":["Checked"]}]}})).await.unwrap();
     change(
         &db,
         "knowledge.create",
-        json!({"record":{
-        "id":knowledge,"project":id,"content":"Keep after Task deletion","basis":"Contract test"}}),
+        json!({"parent":id,"record":{
+        "id":knowledge,"content":"Keep after Task deletion","basis":"Contract test"}}),
     )
     .await
     .unwrap();
@@ -504,56 +611,33 @@ async fn postgres_contract() {
 }
 
 #[tokio::test]
-async fn ticket_assignment_change_preserves_job_specific_run_authority() {
+async fn ticket_identity_is_fixed_and_only_one_run_is_open() {
     let db = db().await;
     seed(&db).await;
-    change(&db,"ticket.create",json!({"record":{"id":"a","task":"t","objective":"Work",
-        "assignee":["default-one"],"jobs":[{"id":"a1","objective":"Work","criteria":["Verified"],"assignee":["operator"]}]}})).await.unwrap();
-    start(&db, "a1", "r").await.unwrap();
-    let a = get(&db, "ticket", "a").await;
-    change(
-        &db,
-        "ticket.update",
-        json!({"id":"a","revision":a["revision"],"patch":{"assignee":["default-two"]}}),
-    )
-    .await
-    .unwrap();
-    finish(&db, "r").await.unwrap();
-}
-#[tokio::test]
-async fn joint_work_in_one_job_keeps_independent_run_authorities() {
-    let db = db().await;
-    seed(&db).await;
-    change(
-        &db,
-        "ticket.create",
-        json!({"record":{"id":"a","task":"t","objective":"Review",
-        "assignee":["reviewer-a","reviewer-b"],
-        "jobs":[{"id":"a1","objective":"Joint review","criteria":["Both reviewed"]}]}}),
-    )
-    .await
-    .unwrap();
-    let job = get(&db, "job", "a1").await;
-    db.call("run.start",json!({"id":"ra","job":"a1","revision":job["revision"],"actor":["reviewer-a"],"reason":"First review"})).await.unwrap();
-    let job = get(&db, "job", "a1").await;
-    db.call("run.start",json!({"id":"rb","job":"a1","revision":job["revision"],"actor":["reviewer-b"],"reason":"Joint review"})).await.unwrap();
-    let job = get(&db, "job", "a1").await;
-    assert_eq!(
-        db.call(
-            "status.set",
-            json!({"id":"a1","revision":job["revision"],
-            "status":"waiting","run":"ra","actor":["reviewer-b"],"reason":"Wrong Run"})
-        )
-        .await
-        .unwrap_err()
-        .code,
-        -32010
-    );
-    for (id, actor) in [("ra", "reviewer-a"), ("rb", "reviewer-b")] {
-        let run = get(&db, "run", id).await;
-        db.call("run.finish",json!({"id":id,"revision":run["revision"],"actor":[actor],"reason":"Review finished","result":"Checked"})).await.unwrap();
+    ticket(&db, "tkt-abcdef-1", &["job-abcdef-1"], &[]).await;
+    start(&db, "job-abcdef-1", "run-abcdef-1").await.unwrap();
+    assert!(start(&db, "job-abcdef-1", "run-abcdef-2").await.is_err());
+    let row = get(&db, "ticket", "tkt-abcdef-1").await;
+    for patch in [
+        json!({"worker_id":"wkr-abcdef-2"}),
+        json!({"session_id":"ssn-abcdef-2"}),
+        json!({"assignee":["operator"]}),
+    ] {
+        assert!(
+            change(
+                &db,
+                "ticket.update",
+                json!({"id":row["record"]["id"],"revision":row["revision"],"patch":patch})
+            )
+            .await
+            .is_err()
+        );
     }
-    complete(&db, "a1").await;
+    let run = get(&db, "run", "run-abcdef-1").await;
+    assert!(db.call("run.finish", json!({"id":run["record"]["id"],"revision":run["revision"],"actor":["wkr-abcdef-1","ssn-abcdef-2"],"reason":"Wrong session","result":"succeeded"})).await.is_err());
+    finish(&db, "run-abcdef-1").await.unwrap();
+    start(&db, "job-abcdef-1", "run-abcdef-2").await.unwrap();
+    assert!(finish(&db, "run-abcdef-1").await.is_err());
 }
 #[tokio::test]
 async fn concurrent_changes_with_the_same_revision_commit_only_once() {
@@ -562,12 +646,12 @@ async fn concurrent_changes_with_the_same_revision_commit_only_once() {
         "sqlite://{}?mode=rwc",
         path.to_string_lossy().replace('\\', "/")
     );
-    let first = Store::connect(&url, true).await.unwrap();
-    let second = Store::connect(&url, false).await.unwrap();
+    let first = connect(&url, true).await.unwrap();
+    let second = connect(&url, false).await.unwrap();
     seed(&first).await;
-    let project = get(&first, "project", "p").await;
-    let left = json!({"id":"p","revision":project["revision"],"patch":{"name":"Left"}});
-    let right = json!({"id":"p","revision":project["revision"],"patch":{"name":"Right"}});
+    let project = get(&first, "project", "pj-abcdef-1").await;
+    let left = json!({"id":"pj-abcdef-1","revision":project["revision"],"patch":{"name":"Left"}});
+    let right = json!({"id":"pj-abcdef-1","revision":project["revision"],"patch":{"name":"Right"}});
     let (left, right) = tokio::join!(
         change(&first, "project.update", left),
         change(&second, "project.update", right)
@@ -587,13 +671,8 @@ async fn concurrent_changes_with_the_same_revision_commit_only_once() {
 #[tokio::test]
 async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     fn short_id(id: &Value, prefix: &str) {
-        let suffix = id.as_str().unwrap().strip_prefix(prefix).unwrap();
-        assert_eq!(suffix.len(), 8);
-        assert!(
-            suffix
-                .bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        );
+        assert!(id.as_str().unwrap().starts_with(prefix));
+        assert!(ttjcore::document::is_id(id.as_str().unwrap()));
     }
     async fn auto(db: &Store, method: &str, p: Value) -> ttjcore::Result<Value> {
         change(db, method, p)
@@ -602,6 +681,20 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     }
 
     let db = db().await;
+    change(
+        &db,
+        "worker.create",
+        json!({"record":{"id":"wkr-abcdef-1","name":"Operator"}}),
+    )
+    .await
+    .unwrap();
+    change(
+        &db,
+        "session.create",
+        json!({"record":{"id":"ssn-abcdef-1","worker_id":"wkr-abcdef-1"}}),
+    )
+    .await
+    .unwrap();
     let request = json!({"operation":"auto-project","record":{"name":"Automatic IDs"}});
     let project = auto(&db, "project.create", request.clone()).await.unwrap();
     assert_eq!(project, auto(&db, "project.create", request).await.unwrap());
@@ -609,14 +702,14 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     let task = auto(
         &db,
         "task.create",
-        json!({"record":{"project":project["record"]["id"],
+        json!({"parent":project["record"]["id"],"record":{
         "objective":"Deliver","criteria":["Verified"]}}),
     )
     .await
     .unwrap();
     short_id(&task["record"]["id"], "tsk-");
     let request = json!({"operation":"auto-ticket","display":{"summary":"Compact card"},
-        "record":{"task":task["record"]["id"],"objective":"Review","jobs":[
+        "record":{"worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":task["record"]["id"],"objective":"Review","jobs":[
         {"objective":"Prepare","criteria":["Ready"],"display":{"icon":"job"}},
         {"objective":"GitHub review","criteria":["Approved"],"display":{"icon":"github"}}]}});
     let ticket = auto(&db, "ticket.create", request.clone()).await.unwrap();
@@ -626,10 +719,10 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     assert!(ticket["record"].get("summary").is_none());
     let ids = ticket["record"]["jobs"].as_array().unwrap();
     for id in ids {
-        short_id(id, "job-");
+        short_id(&id["id"], "job-");
     }
     assert_ne!(ids[0], ids[1]);
-    let job = get(&db, "job", ids[1].as_str().unwrap()).await;
+    let job = get(&db, "job", ids[1]["id"].as_str().unwrap()).await;
     assert_eq!(job["display"]["icon"], "github");
     assert!(job["record"].get("display").is_none());
     let updated = auto(
@@ -641,25 +734,25 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
     .await
     .unwrap();
     assert_eq!(updated["display"]["icon"], "custom.star");
-    let first = get(&db, "job", ids[0].as_str().unwrap()).await;
-    let start = json!({"operation":"auto-run","job":ids[0],"revision":first["revision"]});
+    let first = get(&db, "job", ids[0]["id"].as_str().unwrap()).await;
+    let start = json!({"operation":"auto-run","job":ids[0]["id"],"revision":first["revision"]});
     let run = auto(&db, "run.start", start.clone()).await.unwrap();
-    short_id(&run["run"]["record"]["id"], "");
+    short_id(&run["run"]["record"]["id"], "run-");
     assert_eq!(run, auto(&db, "run.start", start).await.unwrap());
     let knowledge = auto(
         &db,
         "knowledge.create",
-        json!({"record":{"project":project["record"]["id"],"content":"Short IDs","basis":"Contract test"}}),
+        json!({"parent":project["record"]["id"],"record":{"content":"Short IDs","basis":"Contract test"}}),
     )
     .await
     .unwrap();
-    short_id(&knowledge["record"]["id"], "");
+    assert!(!knowledge["record"]["id"].as_str().unwrap().is_empty());
     let all_ids = [
         &project["record"]["id"],
         &task["record"]["id"],
         &ticket["record"]["id"],
-        &ids[0],
-        &ids[1],
+        &ids[0]["id"],
+        &ids[1]["id"],
         &run["run"]["record"]["id"],
         &knowledge["record"]["id"],
     ];
@@ -678,70 +771,24 @@ async fn generated_ids_replay_and_display_metadata_stay_outside_ttj_records() {
 }
 
 #[tokio::test]
-async fn legacy_ids_remain_usable_with_short_ids_and_reserved_after_deletion() {
+async fn legacy_and_wrong_kind_ids_are_rejected() {
     let db = db().await;
-    let legacy = "550e8400-e29b-41d4-a716-446655440000";
-    change(
-        &db,
-        "project.create",
-        json!({"record":{"id":legacy,"name":"Legacy"}}),
-    )
-    .await
-    .unwrap();
-    let request = json!({"operation":"mixed-task","record":{"project":legacy,"objective":"Mixed IDs","criteria":["References preserved"]}});
-    let task = change(&db, "task.create", request.clone()).await.unwrap();
-    assert_eq!(task, change(&db, "task.create", request).await.unwrap());
-    let task_id = task["value"]["record"]["id"].as_str().unwrap();
-    assert!(task_id.starts_with("tsk-"));
-    let snapshot = db
-        .call("project.snapshot", json!({"id":legacy}))
-        .await
-        .unwrap();
-    assert_eq!(snapshot["tasks"][0]["task"]["record"]["project"], legacy);
-    assert_eq!(snapshot["tasks"][0]["task"]["record"]["id"], task_id);
-    assert!(
-        change(
-            &db,
-            "ticket.create",
-            json!({"record":{"id":"same-id","task":task_id,"objective":"Invalid duplicate","jobs":[
-        {"id":"same-id","objective":"Duplicate","criteria":["Rejected"]}]}})
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        db.call("ticket.get", json!({"id":"same-id"}))
+    for id in [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "pj-abcdef-01",
+        "tsk-abcdef-1",
+        "pj-abcdef-0",
+    ] {
+        assert!(
+            change(
+                &db,
+                "project.create",
+                json!({"record":{"id":id,"name":"Invalid"}})
+            )
             .await
             .is_err()
-    );
-    let row = get(&db, "task", task_id).await;
-    change(
-        &db,
-        "status.set",
-        json!({"id":task_id,"revision":row["revision"],"status":"canceled"}),
-    )
-    .await
-    .unwrap();
-    let row = get(&db, "task", task_id).await;
-    change(
-        &db,
-        "task.delete",
-        json!({"id":task_id,"revision":row["revision"]}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        change(
-            &db,
-            "project.create",
-            json!({"record":{"id":task_id,"name":"Reserved"}})
-        )
-        .await
-        .unwrap_err()
-        .code,
-        -32009
-    );
-    assert_eq!(get(&db, "project", legacy).await["record"]["id"], legacy);
+        );
+    }
 }
 
 #[tokio::test]
@@ -751,36 +798,36 @@ async fn snapshot_resolves_current_and_historical_dependencies_across_projects_a
     change(
         &db,
         "project.create",
-        json!({"record":{"id":"other-project","name":"Other"}}),
+        json!({"record":{"id":"pj-abcdef-4","name":"Other"}}),
     )
     .await
     .unwrap();
-    change(&db,"task.create",json!({"record":{"id":"other-task","project":"other-project","objective":"Approval","criteria":["Approved"]}})).await.unwrap();
-    change(&db,"ticket.create",json!({"record":{"id":"external","task":"other-task","objective":"External approval","jobs":[
-        {"id":"external-job","objective":"Approve","criteria":["Reviewed"]}]}})).await.unwrap();
-    ticket(&db, "unrelated", &["unrelated-job"], &[]).await;
-    ticket(&db, "local", &["local-job"], &["external"]).await;
+    change(&db,"task.create",json!({"parent":"pj-abcdef-4","record":{"id":"tsk-abcdef-2","objective":"Approval","criteria":["Approved"]}})).await.unwrap();
+    change(&db,"ticket.create",json!({"record":{"id":"tkt-abcdef-4","worker_id":"wkr-abcdef-1","session_id":"ssn-abcdef-1","task_id":"tsk-abcdef-2","objective":"External approval","jobs":[
+        {"id":"job-abcdef-4","objective":"Approve","criteria":["Reviewed"]}]}})).await.unwrap();
+    ticket(&db, "tkt-abcdef-8", &["job-abcdef-9"], &[]).await;
+    ticket(&db, "tkt-abcdef-5", &["job-abcdef-5"], &["tkt-abcdef-4"]).await;
     let snapshot = db
-        .call("project.snapshot", json!({"id":"p"}))
+        .call("project.snapshot", json!({"id":"pj-abcdef-1"}))
         .await
         .unwrap();
     let dependencies = snapshot["dependencies"].as_array().unwrap();
     assert_eq!(dependencies.len(), 1);
     assert_eq!(dependencies[0]["record"]["objective"], "External approval");
     assert_eq!(dependencies[0]["deleted"], false);
-    start(&db, "external-job", "external-run").await.unwrap();
-    finish(&db, "external-run").await.unwrap();
-    complete(&db, "external-job").await;
-    let row = get(&db, "ticket", "external").await;
+    start(&db, "job-abcdef-4", "run-abcdef-4").await.unwrap();
+    finish(&db, "run-abcdef-4").await.unwrap();
+    complete(&db, "job-abcdef-4").await;
+    let row = get(&db, "ticket", "tkt-abcdef-4").await;
     change(
         &db,
         "ticket.delete",
-        json!({"id":"external","revision":row["revision"]}),
+        json!({"id":"tkt-abcdef-4","revision":row["revision"]}),
     )
     .await
     .unwrap();
     let snapshot = db
-        .call("project.snapshot", json!({"id":"p"}))
+        .call("project.snapshot", json!({"id":"pj-abcdef-1"}))
         .await
         .unwrap();
     assert_eq!(snapshot["dependencies"][0]["deleted"], true);
@@ -788,25 +835,31 @@ async fn snapshot_resolves_current_and_historical_dependencies_across_projects_a
         snapshot["dependencies"][0]["record"]["objective"],
         "External approval"
     );
-    let row = get(&db, "ticket", "local").await;
+    let row = get(&db, "ticket", "tkt-abcdef-5").await;
     change(
         &db,
         "ticket.update",
-        json!({"id":"local","revision":row["revision"],"patch":{"depends":[]}}),
+        json!({"id":"tkt-abcdef-5","revision":row["revision"],"patch":{"depends":[]}}),
     )
     .await
     .unwrap();
     let snapshot = db
-        .call("project.snapshot", json!({"id":"p"}))
+        .call("project.snapshot", json!({"id":"pj-abcdef-1"}))
         .await
         .unwrap();
     assert_eq!(snapshot["dependencies"].as_array().unwrap().len(), 1);
-    assert_eq!(snapshot["dependencies"][0]["record"]["id"], "external");
+    assert_eq!(snapshot["dependencies"][0]["record"]["id"], "tkt-abcdef-4");
     assert!(
         snapshot["timeline"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| event["from"]["record"]["depends"] == json!(["external"]))
+            .any(|event| event["from"]["record"]["depends"] == json!(["tkt-abcdef-4"]))
     );
+}
+
+async fn connect(url: &str, initialize: bool) -> ttjcore::Result<Store> {
+    Store::connect(url, initialize)
+        .await?
+        .with_management_actors(["owner"])
 }

@@ -1,3 +1,4 @@
+pub mod document;
 pub mod engine;
 pub mod entity;
 pub mod ipc;
@@ -5,7 +6,7 @@ pub mod rpc;
 pub mod store;
 
 use serde::Serialize;
-pub const PROTOCOL: &str = "TTJ/1.0.0";
+pub const PROTOCOL: &str = "TTJ/1.1.0";
 
 #[derive(Debug, Serialize)]
 pub struct Error {
