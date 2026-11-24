@@ -655,6 +655,26 @@ impl Engine {
             }
         }
         Self::validate(kind, &row.body)?;
+        if kind == "task" && patch.get("handoff").is_some() && p["mode"] != "management" {
+            let run = self.get(&text(p, "run")?)?;
+            let job = self.parent(&run)?;
+            let ticket = self.parent(&job)?;
+            for (field, expected) in [
+                ("current_ticket_id", json!(ticket.id)),
+                ("current_job_id", json!(job.id)),
+                ("worker_id", ticket.body["worker_id"].clone()),
+                ("session_id", ticket.body["session_id"].clone()),
+            ] {
+                if row.body["handoff"]
+                    .get(field)
+                    .is_some_and(|value| !value.is_null() && *value != expected)
+                {
+                    return Err(rule(
+                        "Execution Handoff must describe its authorized Ticket, current Job and fixed Worker/Session",
+                    ));
+                }
+            }
+        }
         let id = row.id.clone();
         self.save(row, "record.updated")?;
         self.check_cycles()?;
@@ -801,6 +821,16 @@ impl Engine {
         }
         let target = text(p, "status")?;
         let source = text(&row.body, "status")?;
+        if matches!(target.as_str(), "todo" | "doing") {
+            let ticket = match row.kind.as_str() {
+                "job" => Some(self.parent(&row)?),
+                "ticket" => Some(row.clone()),
+                _ => None,
+            };
+            if let Some(ticket) = ticket {
+                Self::task_allows_execution(&self.parent(&ticket)?)?;
+            }
+        }
         if source == target {
             return Ok(self.record_view(&row));
         }
@@ -992,12 +1022,7 @@ impl Engine {
         }
         let ticket = self.parent(job)?;
         let task = self.parent(&ticket)?;
-        if matches!(
-            task.body["status"].as_str(),
-            Some("paused" | "completed" | "canceled")
-        ) {
-            return Err(rule("Task prevents execution"));
-        }
+        Self::task_allows_execution(&task)?;
         if matches!(
             ticket.body["status"].as_str(),
             Some("paused" | "completed" | "canceled")
@@ -1013,6 +1038,12 @@ impl Engine {
         }
         if self.current(&ticket)?.is_none_or(|j| j.id != job.id) {
             return Err(rule("Only the first non-terminal Job may execute"));
+        }
+        Ok(())
+    }
+    fn task_allows_execution(task: &record::Model) -> Result<()> {
+        if task.body["status"] == "paused" || terminal(&task.body) {
+            return Err(rule("Task prevents execution"));
         }
         Ok(())
     }
@@ -1136,6 +1167,17 @@ impl Engine {
             run.body["wait"][key] = value.clone();
         }
         Self::validate("run", &run.body)?;
+        let previous = &self.get(&run.id)?.body["wait"];
+        if previous.is_object()
+            && previous["resolved"].is_null()
+            && (previous["target"] != run.body["wait"]["target"]
+                || !run.body["wait"]["resolved"].is_null())
+        {
+            self.check_wait_completion(previous)?;
+        }
+        if !run.body["wait"]["resolved"].is_null() {
+            self.check_wait_completion(&run.body["wait"])?;
+        }
         let id = run.id.clone();
         let job_id = run.parent.clone().unwrap();
         self.save(run, "run.wait_changed")?;
@@ -1149,6 +1191,20 @@ impl Engine {
         self.check_cycles()?;
         self.reconcile()?;
         Ok(self.record_view(&self.get(&id)?))
+    }
+    fn check_wait_completion(&self, wait: &Value) -> Result<()> {
+        if let Some(target) = wait["target"]
+            .as_str()
+            .filter(|id| document::is_id_of("ticket", id))
+        {
+            let ticket = self.raw(target)?;
+            if ticket.kind != "ticket" || ticket.body["status"] != "completed" {
+                return Err(rule(
+                    "Wait target Ticket must have a verified completed record",
+                ));
+            }
+        }
+        Ok(())
     }
     fn pending_wait(&self, row: &record::Model) -> bool {
         let job = if row.kind == "job" {
@@ -1178,10 +1234,9 @@ impl Engine {
         }
         let ticket = self.parent(&job)?;
         let task = self.parent(&ticket)?;
+        Self::task_allows_execution(&task)?;
         if terminal(&ticket.body)
             || matches!(ticket.body["status"].as_str(), Some("paused" | "blocked"))
-            || terminal(&task.body)
-            || task.body["status"] == "paused"
             || self
                 .current(&ticket)?
                 .is_none_or(|current| current.id != job.id)
@@ -1219,6 +1274,7 @@ impl Engine {
                     "Wait resolution requires verified wait_met=true evidence",
                 ));
             }
+            self.check_wait_completion(&run.body["wait"])?;
             run.body["wait"]["resolved"] = json!(self.now);
             run.flags["wait_evidence"] = json!(evidence);
             Self::validate("run", &run.body)?;
@@ -1432,17 +1488,20 @@ impl Engine {
                     }
                 }
             }
+            let mut loses_guards = row.kind == "run"
+                && row.flags["stop_requested"] == true
+                && row.body.get("result").is_none();
             if matches!(row.kind.as_str(), "task" | "ticket" | "job") && !terminal(&row.body) {
                 let (started, waiting, blocked) = self.restored_guards(&row, &included)?;
-                if row.started != started
+                loses_guards |= row.started != started
                     || (row.flags["waiting"] == true) != waiting
-                    || (row.flags["blocked"] == true) != blocked
-                {
-                    return Err(rule(format!(
-                        "Cannot export {} without losing its resume guards; resolve the hidden constraints or restore a representable state first",
-                        row.id
-                    )));
-                }
+                    || (row.flags["blocked"] == true) != blocked;
+            }
+            if loses_guards {
+                return Err(rule(format!(
+                    "Cannot export {} without losing its execution or resume guards; resolve the hidden constraints or restore a representable state first",
+                    row.id
+                )));
             }
             if row.kind == "run" && row.active {
                 self.validate_open_run(&row)?;

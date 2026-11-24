@@ -254,10 +254,52 @@ async fn mixed_wait_dependencies_remain_acyclic_when_paused_or_blocked() {
             .get("wait")
             .is_none()
     );
+    assert!(
+        wait(&db, RUN, json!({"resolved":"2026-01-01T01:00:00Z"}))
+            .await
+            .is_err()
+    );
+    wait(&db, RUN, json!({"target":"tkt-ABC123-2"}))
+        .await
+        .unwrap();
+    assert!(
+        wait(&db, "run-ABC123-2", json!({"target":TICKET}))
+            .await
+            .is_err()
+    );
+    let run = get(&db, "run", "run-ABC123-2").await;
+    change(
+        &db,
+        "run.finish",
+        json!({"id":"run-ABC123-2","revision":run["revision"],"result":"succeeded"}),
+    )
+    .await
+    .unwrap();
+    state(
+        &db,
+        "job",
+        "job-ABC123-2",
+        "completed",
+        json!({"criteria_met":true,"result":"Verified"}),
+    )
+    .await
+    .unwrap();
     wait(&db, RUN, json!({"resolved":"2026-01-01T01:00:00Z"}))
         .await
         .unwrap();
-    wait(&db, "run-ABC123-2", json!({"target":TICKET}))
+    let run = get(&db, "run", RUN).await;
+    change(
+        &db,
+        "run.finish",
+        json!({"id":RUN,"revision":run["revision"],"result":"interrupted"}),
+    )
+    .await
+    .unwrap();
+    change(&db, "ticket.create", ticket("tkt-ABC123-3", "job-ABC123-3"))
+        .await
+        .unwrap();
+    start(&db, "job-ABC123-3", "run-ABC123-3").await.unwrap();
+    wait(&db, "run-ABC123-3", json!({"target":TICKET}))
         .await
         .unwrap();
     let document = db

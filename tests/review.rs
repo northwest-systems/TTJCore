@@ -88,6 +88,265 @@ async fn evidence(db: &Store, status: &str) -> Value {
     json!({"id":J,"revision":get(db,"job",J).await["revision"],"evidence_run":R,"run_revision":get(db,"run",R).await["revision"],"evidence":"Matched signed approval to the pending request","wait_met":true,"criteria_met":true,"result":"approved","status":status})
 }
 
+async fn snapshot(db: &Store) -> Value {
+    db.call("project.snapshot", json!({"id":P})).await.unwrap()
+}
+
+#[tokio::test]
+async fn execution_handoff_matches_its_ticket_job_worker_and_session() {
+    let db = database().await;
+    seed(&db, &[J, K]).await;
+    admin(&db, "ticket.create", ticket(B, &["job-review-3"]))
+        .await
+        .unwrap();
+    start(&db, J, R).await.unwrap();
+    start(&db, "job-review-3", "run-review-2").await.unwrap();
+    let valid = json!({"current_ticket_id":A,"current_job_id":J,"worker_id":W,"session_id":S,"context":"Current work"});
+    for (field, wrong) in [
+        ("current_ticket_id", B),
+        ("current_job_id", K),
+        ("worker_id", "wkr-review-2"),
+        ("session_id", "ssn-review-2"),
+    ] {
+        for mut handoff in [valid.clone(), json!({})] {
+            handoff[field] = json!(wrong);
+            let before = snapshot(&db).await;
+            assert!(execution(&db,"task.update",json!({"id":T,"revision":get(&db,"task",T).await["revision"],"run":R,"patch":{"handoff":handoff},"display":{"summary":"Must roll back"}})).await.is_err());
+            assert_eq!(before, snapshot(&db).await);
+        }
+    }
+    for handoff in [
+        valid.clone(),
+        json!({"context":"Context only"}),
+        Value::Null,
+    ] {
+        execution(&db,"task.update",json!({"id":T,"revision":get(&db,"task",T).await["revision"],"run":R,"patch":{"handoff":handoff}})).await.unwrap();
+    }
+    let other =
+        json!({"current_ticket_id":B,"current_job_id":"job-review-3","worker_id":W,"session_id":S});
+    admin(
+        &db,
+        "task.update",
+        json!({"id":T,"revision":get(&db,"task",T).await["revision"],"patch":{"handoff":other}}),
+    )
+    .await
+    .unwrap();
+    execution(&db,"task.update",json!({"id":T,"revision":get(&db,"task",T).await["revision"],"run":R,"patch":{"handoff":valid}})).await.unwrap();
+    assert_eq!(
+        get(&db, "task", T).await["record"]["handoff"]["current_ticket_id"],
+        A
+    );
+    assert!(
+        get(&db, "run", "run-review-2").await["active"]
+            .as_bool()
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn paused_parent_prevents_advancement_but_allows_reporting_and_explicit_release() {
+    let db = database().await;
+    seed(&db, &[J]).await;
+    start(&db, J, R).await.unwrap();
+    state(&db, "task", T, "paused", json!({})).await.unwrap();
+    for waiting in [false, true] {
+        if waiting {
+            wait(&db, "external approval").await;
+        }
+        for kind in ["job", "ticket"] {
+            let id = if kind == "job" { J } else { A };
+            for management in [false, true] {
+                let before = snapshot(&db).await;
+                let p = json!({"id":id,"revision":get(&db,kind,id).await["revision"],"status":"doing","release":true,"resolved":true});
+                let result = if management {
+                    admin(&db, "status.set", p).await
+                } else {
+                    let mut p = p;
+                    p["run"] = json!(R);
+                    execution(&db, "status.set", p).await
+                };
+                assert!(result.is_err());
+                assert_eq!(before, snapshot(&db).await);
+            }
+        }
+    }
+    finish(&db, R).await;
+    let before = snapshot(&db).await;
+    assert!(start(&db, J, "run-review-2").await.is_err());
+    assert!(
+        admin(&db, "job.accept_evidence", evidence(&db, "completed").await)
+            .await
+            .is_err()
+    );
+    assert!(state(&db, "task", T, "doing", json!({})).await.is_err());
+    assert_eq!(before, snapshot(&db).await);
+    state(&db, "task", T, "doing", json!({"release":true}))
+        .await
+        .unwrap();
+    admin(&db, "job.accept_evidence", evidence(&db, "completed").await)
+        .await
+        .unwrap();
+    assert_eq!(get(&db, "ticket", A).await["record"]["status"], "completed");
+
+    let canceled = database().await;
+    seed(&canceled, &[J]).await;
+    start(&canceled, J, R).await.unwrap();
+    state(&canceled, "task", T, "paused", json!({}))
+        .await
+        .unwrap();
+    state(&canceled, "task", T, "canceled", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(get(&canceled, "run", R).await["active"], false);
+    canceled
+        .call("document.export", json!({"project":P}))
+        .await
+        .unwrap();
+
+    let unstarted = database().await;
+    seed(&unstarted, &[J]).await;
+    state(&unstarted, "task", T, "paused", json!({}))
+        .await
+        .unwrap();
+    let before = snapshot(&unstarted).await;
+    assert!(
+        state(&unstarted, "job", J, "todo", json!({"release":true}))
+            .await
+            .is_err()
+    );
+    assert!(start(&unstarted, J, R).await.is_err());
+    assert_eq!(before, snapshot(&unstarted).await);
+    state(&unstarted, "task", T, "todo", json!({"release":true}))
+        .await
+        .unwrap();
+    start(&unstarted, J, R).await.unwrap();
+}
+
+#[tokio::test]
+async fn live_ticket_wait_resolution_requires_completion_and_preserves_pending_edges() {
+    let db = database().await;
+    seed(&db, &[J]).await;
+    admin(&db, "ticket.create", ticket(B, &[K])).await.unwrap();
+    start(&db, J, R).await.unwrap();
+    admin(
+        &db,
+        "ticket.create",
+        ticket("tkt-review-3", &["job-review-3"]),
+    )
+    .await
+    .unwrap();
+    state(
+        &db,
+        "ticket",
+        "tkt-review-3",
+        "canceled",
+        json!({"cancel_reason":"Scope canceled"}),
+    )
+    .await
+    .unwrap();
+    for target in [B, "tkt-review-3", "tkt-review-99"] {
+        let before = snapshot(&db).await;
+        assert!(execution(&db,"run.wait",json!({"id":R,"revision":get(&db,"run",R).await["revision"],"wait":{"target":target,"resolved":"2026-01-01T01:00:00Z"}})).await.is_err());
+        assert_eq!(before, snapshot(&db).await);
+    }
+    wait(&db, B).await;
+    for patch in [
+        json!({"resolved":"2026-01-01T01:00:00Z"}),
+        json!({"target":"external","resolved":"2026-01-01T01:00:00Z"}),
+        json!({"target":"external"}),
+    ] {
+        let before = snapshot(&db).await;
+        assert!(
+            execution(
+                &db,
+                "run.wait",
+                json!({"id":R,"revision":get(&db,"run",R).await["revision"],"wait":patch})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(before, snapshot(&db).await);
+    }
+    let before = snapshot(&db).await;
+    assert!(
+        admin(
+            &db,
+            "ticket.update",
+            json!({"id":B,"revision":get(&db,"ticket",B).await["revision"],"patch":{"depends":[A]}})
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(before, snapshot(&db).await);
+    state(&db, "job", K, "canceled", json!({})).await.unwrap();
+    admin(
+        &db,
+        "ticket.delete",
+        json!({"id":B,"revision":get(&db,"ticket",B).await["revision"]}),
+    )
+    .await
+    .unwrap();
+    execution(&db,"run.wait",json!({"id":R,"revision":get(&db,"run",R).await["revision"],"wait":{"resolved":"2026-01-01T01:00:00Z"}})).await.unwrap();
+    assert_eq!(get(&db, "run", R).await["record"]["wait"]["target"], B);
+    assert!(get(&db, "run", R).await["record"]["wait"]["resolved"].is_string());
+    state(&db, "job", J, "doing", json!({"resolved":true}))
+        .await
+        .unwrap();
+    finish(&db, R).await;
+}
+
+#[tokio::test]
+async fn exports_reject_open_stop_requests_until_the_run_is_closed() {
+    for scope in ["task", "ticket", "job"] {
+        let db = database().await;
+        seed(&db, &[J]).await;
+        start(&db, J, R).await.unwrap();
+        db.call("document.export", json!({"project":P}))
+            .await
+            .unwrap();
+        let id = match scope {
+            "task" => T,
+            "ticket" => A,
+            _ => J,
+        };
+        state(&db, scope, id, "paused", json!({})).await.unwrap();
+        state(&db, scope, id, "doing", json!({"release":true}))
+            .await
+            .unwrap();
+        let before = snapshot(&db).await;
+        for p in [json!({"project":P}), json!({"tickets":[A]})] {
+            let error = db.call("document.export", p).await.unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("without losing its execution or resume guards")
+            );
+            assert_eq!(before, snapshot(&db).await);
+        }
+        finish(&db, R).await;
+        let value = db
+            .call("document.export", json!({"project":P}))
+            .await
+            .unwrap();
+        let document = Document::parse(&value).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("ttj-stop-export-{}", uuid::Uuid::new_v4()));
+        let paths = document.write_split(&directory).unwrap();
+        assert_eq!(
+            Document::merge(
+                paths
+                    .iter()
+                    .map(Document::read)
+                    .collect::<ttjcore::Result<Vec<_>>>()
+                    .unwrap()
+            )
+            .unwrap(),
+            document
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn work_changes_require_live_execution_or_explicit_authorized_management() {
     let db = database().await;
@@ -278,34 +537,53 @@ async fn late_evidence_resolves_only_the_named_wait_and_transitions_atomically()
     let mut p = evidence(&db, "doing").await;
     p["run"] = json!(R);
     assert!(execution(&db, "job.accept_evidence", p).await.is_err());
-    execution(&db, "job.accept_evidence", evidence(&db, "doing").await)
+    let before = (
+        get(&db, "run", R).await,
+        get(&db, "job", J).await,
+        get(&db, "ticket", A).await,
+    );
+    for status in ["doing", "completed"] {
+        assert!(
+            execution(&db, "job.accept_evidence", evidence(&db, status).await)
+                .await
+                .is_err()
+        );
+        assert_eq!(before.0, get(&db, "run", R).await);
+        assert_eq!(before.1, get(&db, "job", J).await);
+        assert_eq!(before.2, get(&db, "ticket", A).await);
+    }
+    let b = get(&db, "ticket", B).await;
+    assert!(
+        admin(
+            &db,
+            "ticket.update",
+            json!({"id":B,"revision":b["revision"],"patch":{"depends":[A]}})
+        )
+        .await
+        .is_err()
+    );
+    start(&db, K, "run-review-2").await.unwrap();
+    finish(&db, "run-review-2").await;
+    state(
+        &db,
+        "job",
+        K,
+        "completed",
+        json!({"criteria_met":true,"result":"Verified prerequisite"}),
+    )
+    .await
+    .unwrap();
+    execution(&db, "job.accept_evidence", evidence(&db, "completed").await)
         .await
         .unwrap();
     let after = get(&db, "run", R).await;
     assert!(after["record"]["wait"]["resolved"].is_string());
     assert_eq!(after["record"]["result"], before.0["record"]["result"]);
     assert_eq!(after["record"]["ended"], before.0["record"]["ended"]);
-    assert_eq!(get(&db, "job", J).await["record"]["status"], "doing");
-    assert_eq!(get(&db, "ticket", A).await["record"]["status"], "doing");
-    let b = get(&db, "ticket", B).await;
-    admin(
-        &db,
-        "ticket.update",
-        json!({"id":B,"revision":b["revision"],"patch":{"depends":[A]}}),
-    )
-    .await
-    .unwrap();
-    state(
-        &db,
-        "job",
-        J,
-        "completed",
-        json!({"criteria_met":true,"result":"approved"}),
-    )
-    .await
-    .unwrap();
+    assert_eq!(get(&db, "job", J).await["record"]["status"], "completed");
+    assert_eq!(get(&db, "job", J).await["record"]["result"], "approved");
     assert_eq!(get(&db, "ticket", A).await["record"]["status"], "completed");
-    assert_eq!(get(&db, "ticket", B).await["record"]["status"], "todo");
+    assert_eq!(get(&db, "ticket", B).await["record"]["status"], "completed");
     assert!(
         admin(&db, "job.accept_evidence", evidence(&db, "doing").await)
             .await
