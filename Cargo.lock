@@ -1872,6 +1872,7 @@ dependencies = [
 name = "ttjcore"
 version = "0.1.1"
 dependencies = [
+ "base64",
  "interprocess",
  "sea-orm",
  "serde",

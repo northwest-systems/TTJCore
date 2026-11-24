@@ -10,6 +10,7 @@ Usage:
   ttjcore methods
   ttjcore call METHOD [--params JSON | --file FILE]
   ttjcore rpc
+  ttjcore watch TICKET [--osc7501]
   ttjcore export PROJECT (--file FILE | --directory DIR)
   ttjcore import --file FILE [--file FILE ...] --actor JSON --reason TEXT [--operation ID]
 Environment:
@@ -93,6 +94,14 @@ async fn run() -> std::result::Result<(), String> {
     }
     if command == "rpc" {
         return ipc::bridge(&home).await.map_err(|e| e.to_string());
+    }
+    if command == "watch" {
+        if args.len() < 2 || args.len() > 3 || args.len() == 3 && args[2] != "--osc7501" {
+            return Err("Use watch TICKET [--osc7501]".into());
+        }
+        return ttjcore::progress::watch(&home, &args[1], args.len() == 3)
+            .await
+            .map_err(|e| e.to_string());
     }
     if command == "export" {
         if args.len() != 4 || !matches!(args[2].as_str(), "--file" | "--directory") {

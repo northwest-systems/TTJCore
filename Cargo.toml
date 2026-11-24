@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "TTJ 1.1.0 CLI and port-free JSON-RPC backend"
 
 [dependencies]
+base64 = "0.22"
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "with-json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }

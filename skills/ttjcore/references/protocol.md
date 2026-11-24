@@ -23,6 +23,7 @@ ttjcore stop
 - `rpc`はstdio bridge。stdin・stdoutを開いたまま複数のrequestやeventを扱える。
 - `methods`はCoreを起動せずmethod・fieldの情報を返す。同じ情報を`rpc.discover`でも取得できる。
 - `stop`は同じprofileのCoreを停止する。TTJのrecordは変更しない。
+- `watch TICKET [--osc7501]`は対象Ticketの現在の状態・Run進捗を監視する。既定は1行ずつJSON、OSC形式は端末出力のみ。
 
 profileは`--home <data-dir>`、未指定時は`TTJCORE_HOME`で選びます。両方を省略するとWindowsは`LOCALAPPDATA/.ttjcore`、Linux・macOSは`$HOME/.ttjcore`です。すべてのclientで同じprofileを使ってください。
 
@@ -210,6 +211,8 @@ Ticket中止ではstatus.setにcancel_reasonが必須です。Task中止では�
 
 ## Event
 
+進捗報告は`run.progress`、現在Job/Runを含む原子的な参照は`ticket.snapshot`を使います。percent・messageは標準TTJ recordの外にあるRun wrapperのprogressとして返します。100%の報告では業務状態を変えません。入力制約とOrca向けwatch出力は[進捗APIと通知](../../../docs/progress-notifications.md)を参照してください。
+
 LLMやagentはCoreから直接eventを取得します。UIを経由しません。
 
 | method | 動作 |
@@ -232,7 +235,7 @@ optionalのprojectで絞り込めます。cursor省略時は現在位置から�
 
 eventはcommit済みの履歴を参照します。同じoperationの再送では新しいeventを作りません。切断後は最後に受け取ったcursorから再接続します。クライアントはevents.waitまたはevents.subscribeで変更を監視し、必要に応じてsnapshotを更新します。
 
-eventの種類は`record.created`・`record.updated`・`record.deleted`・`status.changed`・`record.imported`・`run.wait_resolved`・`evidence.accepted`・`run.wait_changed`・`run.started`・`run.finished`・`execution.stop_requested`・`knowledge.superseded`です。eventは変更の概要なので、詳細はgetまたはsnapshotで取得します。Runへのexecution.stop_requestedを受けた場合は、run.getのconstraintsにあるstop_requestedを確認し、実行側で停止に対応してください。
+eventの種類は`record.created`・`record.updated`・`record.deleted`・`status.changed`・`record.imported`・`run.wait_resolved`・`evidence.accepted`・`run.wait_changed`・`run.started`・`run.finished`・`run.progress_changed`・`execution.stop_requested`・`knowledge.superseded`です。eventは変更の概要なので、詳細はgetまたはsnapshotで取得します。Runへのexecution.stop_requestedを受けた場合は、run.getのconstraintsにあるstop_requestedを確認し、実行側で停止に対応してください。
 
 実行するagentはrun.start・run.finish・status.setで状態を記録します。CoreはCodex・Claude Codeのprocessを自動で検出・操作しません。
 

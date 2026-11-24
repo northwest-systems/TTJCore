@@ -98,6 +98,7 @@ impl Store {
         if method.ends_with(".get")
             || method.ends_with(".list")
             || method == "project.snapshot"
+            || method == "ticket.snapshot"
             || method == "document.export"
         {
             let isolation = if self.db.get_database_backend() == sea_orm::DbBackend::Postgres {
@@ -116,7 +117,9 @@ impl Store {
                 .await?;
             let cursor = events.last().map_or(0, |e| e.id);
             let mut result = read(method, &params, rows, events)?;
-            if method == "project.snapshot" || method.ends_with(".list") && result.is_object() {
+            if matches!(method, "project.snapshot" | "ticket.snapshot")
+                || method.ends_with(".list") && result.is_object()
+            {
                 result["cursor"] = json!(cursor);
             }
             tx.commit().await?;
@@ -413,7 +416,12 @@ fn is_mutation(method: &str) -> bool {
     }
     if matches!(
         method,
-        "status.set" | "run.start" | "run.finish" | "run.wait" | "job.accept_evidence"
+        "status.set"
+            | "run.start"
+            | "run.finish"
+            | "run.wait"
+            | "run.progress"
+            | "job.accept_evidence"
     ) {
         return true;
     }
@@ -445,6 +453,9 @@ fn read(
     };
     if method == "document.export" {
         return Ok(engine.export(p)?.to_value());
+    }
+    if method == "ticket.snapshot" {
+        return engine.ticket_snapshot(p);
     }
     if method == "timeline.list" {
         let project = text(p, "project")?;
@@ -636,6 +647,8 @@ pub fn discover() -> Value {
         json!({"name":"document.export","mutates":false,"required":[],"optional":["project","tickets"]}),
         json!({"name":"document.import","mutates":true,"required":["actor","reason","documents"]}),
         json!({"name":"run.wait","mutates":true,"required":["actor","reason","id","revision","wait"]}),
+        json!({"name":"run.progress","mutates":true,"required":["actor","reason","id","revision"],"optional":["percent","message"],"description":"Report current Run telemetry; percent or message is required, null clears a field"}),
+        json!({"name":"ticket.snapshot","mutates":false,"required":["id"],"description":"Read the parent Task, current Job and latest Run with progress and cursor atomically"}),
         json!({"name":"task.purge","mutates":true,"required":["actor","id","revision"],
             "description":"Physically remove a terminal Task and all descendants; retain summary history and Knowledge; reject external Ticket references"}),
         json!({"name":"core.stop","mutates":false,"required":[],"transport":"IPC service control"}),
