@@ -1,6 +1,6 @@
 ---
 name: ttjcore
-description: TTJCoreでProject・Task・Ticket・Job・Run・Worker・Session・Knowledgeを管理し、CLIやJSON-RPCでCRUD、Runの記録、statusの変更、eventの監視を行う。TTJに従う作業をLLMから進める場合に使う。
+description: TTJCoreでProject・Task・Ticket・Job・Run・Worker・Session・Knowledgeを管理し、CLIやJSON-RPCでCRUD、Runの記録、statusの変更、eventの監視を行う。毎セッション開始・引き継ぎ時のKnowledge必読や、該当Ticket処理時のHandoff参照を含め、TTJに従う作業をLLMから進める場合に使う。
 ---
 
 # TTJCore
@@ -9,7 +9,51 @@ description: TTJCoreでProject・Task・Ticket・Job・Run・Worker・Session・
 
 Coreの利用契約は[protocol](references/protocol.md)を読む。接続・method・record・event・errorをこの文書から確認し、実機の`ttjcore methods`で対応methodとfieldを確認する。
 
-Coreへ直接接続する。標準接続では`ttjcore ensure`で準備し、custom profileでは全コマンドに同じ`--home <data-dir>`を指定する。`project.list`から対象Projectを選び、`project.snapshot`でTask・Ticket・Job・Knowledgeとtimelineを取得する。
+## セッション開始・引き継ぎ時の必須ルール（Knowledge 必読 / Handoff 対象限定）
+
+- **Knowledge は毎セッション開始・引き継ぎ時に自発的に読みに行く（必須）**：
+  新規セッションを開始したとき、および別セッションや別エージェントから作業を引き継いだときは、**ユーザーから指示されなくても、計画・実装・回答に入る前に LLM が自発的かつ最初に**対象 Project の Knowledge を取得して読む。前セッションの要約や会話履歴だけに頼らず、Core 上の最新の `active` Knowledge（内容 `content` と根拠 `basis`）を必ず確認する。通常は `status: "active"` のみを使い、振り返り・再発障害・過去判断の調査時だけ `supersed` も参照する。
+- **Handoff は該当 Ticket を処理するときだけ読む（対象限定）**：
+  `Task.handoff` は、**自分が着手・継続・引き継ぎ処理する該当 Ticket の作業文脈を確認するときだけ**参照する。毎セッション開始時に Project 内の全 Task・全 Ticket の Handoff を読みに行く必要はない（コンテキストの浪費を防ぎ、担当 Ticket の文脈だけに絞る）。
+
+### Knowledge と Handoff の使い分け
+
+| 項目 | Knowledge（`Project.knowledge`） | Handoff（`Task.handoff`） |
+|---|---|---|
+| 読むタイミング | **毎セッション開始時・セッション引き継ぎ時に自発的かつ必須** | **該当 Ticket を着手・継続・引き継ぎ処理するときのみ** |
+| 対象範囲 | Project 全体の継続的な知見・暗黙ルール・設計判断と根拠 | 特定 Ticket 処理中の作業文脈・停止位置・ブロッカー |
+| 性質・寿命 | 永続（`active` / `supersed`）。Task 完了・削除後も保持 | 揮発性単一スロット。Task 完了時に自動消去 |
+| 毎セッション全件確認 | **必須**（対象 Project の `active` Knowledge を必ず読む） | **不要**（処理対象の該当 Ticket だけ読む） |
+| 主な参照コマンド | `knowledge.list` / `knowledge.get` | `ticket.snapshot` / `task.get` |
+
+### セッション開始・引き継ぎの標準フロー
+
+Core へ直接接続する。標準接続では `ttjcore ensure` で準備し、custom profile では全コマンドに同じ `--home <data-dir>` を指定する。
+
+1. **Core 接続と対象 Project の特定**：
+   ```sh
+   ttjcore ensure
+   ttjcore call project.list
+   ```
+2. **現行 Knowledge の自発的な読み込み（毎セッション必須・最優先）**：
+   対象 `<project-id>` の Knowledge を取得し、`record.status` が `"active"` の全件について `content` と `basis` を読む。特定の Knowledge を個別に確認・再取得する場合は `knowledge.get` を使う。
+   ```sh
+   ttjcore call knowledge.list --params '{"parent":"<project-id>"}'
+   ttjcore call knowledge.get --params '{"id":"<knowledge-id>"}'
+   ```
+3. **該当 Ticket を処理する場合のみ、Ticket 状態と親 Task の Handoff を取得**：
+   処理対象の `<ticket-id>` が決まっているときは `ticket.snapshot` で対象 Ticket・現在 Job・最新 Run と親 Task（`task.record.handoff`）を一括取得する。親 Task の Handoff だけを確認する場合は `task.get` を使う。
+   ```sh
+   ttjcore call ticket.snapshot --params '{"id":"<ticket-id>"}'
+   ttjcore call task.get --params '{"id":"<task-id>"}'
+   ```
+   - `Task.handoff` は Task 内の揮発性単一スロットのため、`current_ticket_id` や Ticket の `refs` を確認して処理対象 Ticket の文脈かを判別する。
+   - Handoff は補足キャッシュであり、再開条件・前提依存・中止理由・成果物の正本は永続レコード（`depends`・`Run.wait`・`Run.result`・`Ticket.cancel_reason`・`resume`・`artifacts`）で確認する。
+   - Handoff を閲覧できることは Ticket の実行権限を意味しない（確定済みの `worker_id`・`session_id` が一致する担当 Session のみが実行できる）。
+4. **Project 全体の俯瞰が必要な場合のみ `project.snapshot` を使う**：
+   Task 一覧・Ticket 構造・依存・timeline をまとめて把握したいときだけ `ttjcore call project.snapshot --params '{"id":"<project-id>"}'` を使う（`project.snapshot` の `knowledge` には `active` Knowledge が含まれる）。
+
+## 更新・実行・運用ルール
 
 変更には実際のactor、reason、再送用の固有operationを指定する。実行由来の変更では現行runを必ず指定する。管理・範囲変更・文書importではmode=managementと外部設定で許可された管理主体を指定し、実行元runと混在させない。終了後の承認はjob.accept_evidenceで検証内容を記録し、waitの解決とJobの遷移をまとめて確定する。IDは通常省略してCoreの発行結果を使う。更新・削除・statusの変更では最新のrevisionを使う。同じ操作の再送はoperationとrequestを維持し、conflict時は読み直す。
 

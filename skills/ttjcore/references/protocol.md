@@ -92,6 +92,7 @@ Jobは`ticket.create`の`record.jobs`に完全な定義を並べます。参照�
 | `<kind>.update` | `actor, reason, id, revision, patch`。Runを除く |
 | `<kind>.delete` | `actor, reason, id, revision`。Job・Runを除く |
 | `project.snapshot` | Projectの`id`。`project, tasks, timeline, knowledge, dependencies, cursor`を返す |
+| `ticket.snapshot` | Ticketの`id`。`project_id, task, ticket, job, run, cursor`を原子的に返す |
 | `timeline.list` | `project`。履歴の配列を返す |
 | `status.set` | `actor, reason, id, revision, status` |
 | `task.purge` | `actor, id, revision`。終了したTaskと全配下を物理削除し要約履歴を保持 |
@@ -105,7 +106,11 @@ record wrapperには`kind, record, revision, deleted, started, active, constrain
 
 `timeline.list`とsnapshotの`timeline`には、各履歴の対象種別を`kind`で返します。値は`project`・`task`・`ticket`・`job`・`run`・`knowledge`・`worker`・`session`です。物理削除後の要約履歴にも種別を保持します。
 
-`project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotの`knowledge`はactiveなKnowledgeを返します。
+`project.snapshot`の`tasks`は`{task, tickets}`、各Ticketは`{ticket, jobs}`です。これらのrecordはwrapperで返り、`jobs`は実行順です。snapshotの`knowledge`は`active`なKnowledgeを返します。
+
+`knowledge.list`は`parent`（または`project`）にProject IDを指定して対象Projectの未削除Knowledge（`active`・`supersed`の両方）を`items`で返します。セッション開始・引き継ぎ時は通常`record.status`が`active`の項目を自発的に参照し、振り返りや再発調査では`supersed`も確認します。
+
+`ticket.snapshot`は対象Ticketの現在Job・最新Runとともに親Task（`task.record.handoff`を含む）を単一の読み取りtransactionで返します。該当Ticketを処理するときだけHandoffを参照する場合は`project.snapshot`全体ではなく`ticket.snapshot`または`task.get`を使います。
 
 `dependencies`は、現在のTicketとtimelineの`depends`が参照するTicketのwrapper配列です。別Project・削除済みの参照先も含め、UIは`record.objective`を表示名に使えます。既存の`tasks`・`timeline`の構造は変わりません。
 
