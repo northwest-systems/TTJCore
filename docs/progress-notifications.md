@@ -83,9 +83,3 @@ JSON出力には制御シーケンスを混ぜません。`--osc7501`はstdout�
 形式は[Program Status Protocol revision 0.4](https://www.superlogical.com/rex/docs/build/program-status)に従います。title/msgはUTF-8から標準Base64へ変換し、制御文字を空白に置換して、文字境界を保ったままそれぞれ192/2048 bytes以内に収めます。毎回全キーを出し、古い進捗率を残しません。中断時はidleを出します。
 
 符号化にはCargoが取得するbase64 crateを使います。Orcaは[OSC 7501と既存hookを併用](https://github.com/stablyai/orca/pull/30261)するため、agentとは別の監視端末で利用できます。OSCは実行認可やOrcaへのコマンド送信を行いません。
-
-## TTJWebから利用する
-
-ブラウザはTTJWebのローカルサーバーを経由してCoreへ接続します。表示にはget/list・ticket.snapshotとevent、進捗報告にはrun.progressを使います。CoreのDB・IPC tokenへブラウザから直接アクセスさせません。
-
-TTJWebサーバーはホスト側の許可主体と担当Sessionを扱い、ブラウザから渡された任意のactorを認証済み主体として信用しません。Coreは従来どおりローカルIPCと既存の管理・実行認可を使います。
